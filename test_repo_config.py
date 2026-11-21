@@ -27,7 +27,7 @@ class RepoConfigTests(unittest.TestCase):
 
     def test_api_rejects_reused_name_with_different_id(self):
         gh = GitHubReadOnly({42: 'new/name'})
-        response = {'state': 'open', 'draft': False, 'head': {'sha': 'a'*40}, 'base': {'repo': {'id': 43}}}
+        response = {'state': 'open', 'draft': False, 'head': {'sha': 'a'*40}, 'base': {'sha': 'b'*40, 'repo': {'id': 43, 'full_name': 'new/name'}}}
         with patch('github_adapter._gh_get', return_value=json.dumps(response).encode()):
             with self.assertRaises(ValueError):
                 gh.current('new/name', 1)
