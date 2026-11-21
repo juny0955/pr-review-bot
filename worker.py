@@ -99,6 +99,9 @@ class Worker:
             columns = {row[1] for row in db.execute('PRAGMA table_info(work)')}
             if 'next_attempt_at' not in columns:
                 db.execute('ALTER TABLE work ADD COLUMN next_attempt_at REAL')
+            if 'completed_at' not in columns:
+                db.execute('ALTER TABLE work ADD COLUMN completed_at REAL')
+                db.execute("UPDATE work SET completed_at=? WHERE status IN ('done','skipped','failed')", (self.clock(),))
 
     def claim(self):
         token = uuid.uuid4().hex
@@ -107,9 +110,9 @@ class Worker:
             now = self.clock()
             # A crashed final attempt must also become terminal; do not reclaim it.
             db.execute('''UPDATE work SET status='failed', lease_token=NULL, lease_until=NULL,
-                next_attempt_at=NULL, result=? WHERE attempts >= 3 AND
+                next_attempt_at=NULL, result=?, completed_at=? WHERE attempts >= 3 AND
                 (status='retry' OR (status='running' AND lease_until <= ?))''',
-                (json.dumps({'status': 'failed', 'reason': 'processing failed'}), now))
+                (json.dumps({'status': 'failed', 'reason': 'processing failed'}), now, now))
             db.execute('''UPDATE work SET status='retry', next_attempt_at=lease_until +
                 CASE attempts WHEN 1 THEN 30 ELSE 60 END, lease_token=NULL, lease_until=NULL,
                 result=? WHERE status='running' AND lease_until <= ? AND attempts < 3''',
@@ -143,8 +146,9 @@ class Worker:
                 else:
                     next_attempt = now + 30 * (2 ** (row[0] - 1))
             db.execute('''UPDATE work SET status=?,result=?,lease_token=NULL,lease_until=NULL,
-                next_attempt_at=? WHERE delivery_id=?''',
-                (status, json.dumps(result, ensure_ascii=True), next_attempt, delivery))
+                next_attempt_at=?, completed_at=? WHERE delivery_id=?''',
+                (status, json.dumps(result, ensure_ascii=True), next_attempt,
+                 now if status in ('done', 'skipped', 'failed') else None, delivery))
             return True
 
     def run_once(self):

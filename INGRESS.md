@@ -1,0 +1,11 @@
+# Experimental loopback ingress
+
+`python3 ingress.py` listens only on `127.0.0.1:8081` and forwards to the receiver at `127.0.0.1:8080`. It is **not activated by this project**, has not been tested with Tailscale Funnel, and must not be exposed until independently reviewed and tested against the real Funnel deployment. This is not a substitute for a mature, independently audited reverse proxy or OS resource controls.
+
+It accepts one HTTP/1.1 POST to `/webhook` per connection, requires exactly one Content-Length (maximum 1 MiB), rejects transfer encoding and ambiguous framing, and closes the connection. The receiver remains responsible for signature and authorization checks. It limits active accepted connections to 32, globally limits connection starts with a 30-token burst and 10 tokens/second, limits headers to 16 KiB and upstream responses to 64 KiB, and applies a 15-second absolute exchange deadline. Excess connections are closed without an HTTP response. These are global limits, not per-client limits; Funnel's localhost peer does not provide a trustworthy client IP for attribution. A flood can starve legitimate deliveries. The receiver can commit a request before a timeout or disconnected response; retries must rely on its deduplication.
+
+Upstream responses are buffered through connection close and must have exactly one valid Content-Length matching the complete body. Transfer-Encoding (including chunked), close-delimited bodies, informational responses, malformed headers and oversized responses are rejected with 502; an upstream deadline returns 504. The total 64 KiB limit includes headers. Use a full HTTP proxy if other response framing is required.
+
+No TLS, authentication between local processes, service management, firewall, deployment, monitoring, or automatic Funnel configuration is provided. Local users can bypass the ingress and contact the receiver directly; localhost is not a security boundary. Do not expose the receiver port or treat forwarded headers as trusted identity. Multiple ingress processes each have independent limits. Configure Funnel only after security review and end-to-end validation; doing so is outside this experimental implementation.
+
+Run tests with `python3 -m unittest test_ingress -v`.
