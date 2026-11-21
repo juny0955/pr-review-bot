@@ -212,5 +212,5 @@ class Worker:
             raise ValueError('invalid review')
         if eligible(base_sha) is None:
             return {'status': 'skipped', 'reason': 'stale or ineligible PR'}
-        return {'status': 'done', 'repository': repo, 'number': number, 'sha': sha,
+        return {'status': 'done', 'repo_id': repo_id, 'repository': repo, 'number': number, 'sha': sha,
                 'base_sha': base_sha, 'review': review}

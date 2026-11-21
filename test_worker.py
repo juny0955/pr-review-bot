@@ -72,6 +72,7 @@ class WorkerTest(unittest.TestCase):
         self.enqueue()
         result = self.worker.run_once()
         self.assertEqual(result['status'], 'done')
+        self.assertEqual(result['repo_id'], 123)
         self.assertEqual(result['review'], 'fake review')
         self.assertEqual(result['base_sha'], 'b' * 40)
         self.assertEqual(self.model.calls[0]['wiki'][0]['text'], 'Review evidence')

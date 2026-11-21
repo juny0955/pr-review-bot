@@ -19,6 +19,11 @@ from repo_config import allowed
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 
 
+def _require_revocation_gate():
+    # ponytail: no safe shared revocation gate exists; keep live posting disabled.
+    raise ValueError('publication disabled: no shared revocation gate')
+
+
 class GitHubPublisher:
     def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None):
         if type(enabled) is not bool:
@@ -43,6 +48,7 @@ class GitHubPublisher:
             raise ValueError('invalid review')
         if not self.enabled:
             return 'dry_run'
+        _require_revocation_gate()
         actual = self.current(repo, number)
         if (not isinstance(actual, dict) or type(actual.get('repo_id')) is not int
                 or actual.get('repo_id') != repo_id or actual.get('repo') != repo

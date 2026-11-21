@@ -165,7 +165,9 @@ class AdapterTests(unittest.TestCase):
         from publisher import GitHubPublisher
         pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA},
                          'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
-        with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr):
+        # Exercise the dormant publisher path with fake transports only.
+        with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr), \
+             patch('publisher._require_revocation_gate'):
             post = Mock()
             publisher = GitHubPublisher(post, GitHubReadOnly({123: REPO}).current, {123: REPO},
                                         enabled=True, ledger_path=Path(directory) / 'ledger', get=Mock())
