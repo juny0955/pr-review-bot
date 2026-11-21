@@ -33,11 +33,47 @@ class WorkerTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('INSERT INTO queue(delivery_id, body) VALUES (?,?)', (delivery, json.dumps(data or payload()).encode()))
 
+    def test_invalid_policy_is_retried_not_skipped(self):
+        policy = self.root / 'policy.json'
+        policy.write_text('{broken')
+        self.worker.repos = policy
+        self.enqueue()
+        self.assertEqual(self.worker.run_once()['status'], 'retry')
+        self.assertEqual(self.model.calls, [])
+
+    def test_base_movement_during_review_discards_result(self):
+        self.enqueue()
+        states = iter([{'state': 'open', 'draft': False, 'sha': SHA, 'base_sha': 'b' * 40},
+                       {'state': 'open', 'draft': False, 'sha': SHA, 'base_sha': 'c' * 40}])
+        self.gh.current = lambda *args: next(states)
+        self.assertEqual(self.worker.run_once()['status'], 'retry')
+
+    def test_aba_base_movement_retries_before_model(self):
+        from github_adapter import GitHubReadOnly
+        from unittest.mock import patch
+        gh = GitHubReadOnly({123: 'example-owner/example-repo'})
+        a = {'state': 'open', 'draft': False, 'sha': SHA, 'base_sha': 'b' * 40}
+        self.worker.github = gh
+        self.enqueue()
+        # Identical observations cannot rule out A -> B -> A inside a fetch.
+        with patch.object(gh, 'current', return_value=a), patch('github_adapter._gh_get') as get:
+            self.assertEqual(self.worker.run_once()['status'], 'retry')
+            get.assert_not_called()
+        self.assertEqual(self.model.calls, [])
+
+    def test_unpublishable_model_reviews_are_retried(self):
+        for index, review in enumerate(('', '   ', 'x' * 65537)):
+            with self.subTest(length=len(review)):
+                self.model.review = lambda request: review
+                self.enqueue(delivery=str(index))
+                self.assertEqual(self.worker.run_once()['status'], 'retry')
+
     def test_review_is_durable_and_not_repeated(self):
         self.enqueue()
         result = self.worker.run_once()
         self.assertEqual(result['status'], 'done')
         self.assertEqual(result['review'], 'fake review')
+        self.assertEqual(result['base_sha'], 'b' * 40)
         self.assertEqual(self.model.calls[0]['wiki'][0]['text'], 'Review evidence')
         self.assertIsNone(self.worker.run_once())
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -68,7 +104,7 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(self.worker.run_once()['status'], 'skipped')
         self.assertEqual(self.model.calls, [])
         self.enqueue(delivery='second')
-        states = iter([{'state':'open','draft':False,'sha':SHA}, {'state':'open','draft':True,'sha':SHA}])
+        states = iter([{'state':'open','draft':False,'sha':SHA,'base_sha':'b'*40}, {'state':'open','draft':True,'sha':SHA,'base_sha':'b'*40}])
         self.gh.current = lambda *args: next(states)
         self.assertEqual(self.worker.run_once()['status'], 'skipped')
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -212,8 +248,8 @@ class WorkerTest(unittest.TestCase):
 
 class FakeGH:
     def current(self, repo, number):
-        return {'state': 'open', 'draft': False, 'sha': SHA}
-    def diff(self, repo, number, sha):
+        return {'state': 'open', 'draft': False, 'sha': SHA, 'base_sha': 'b' * 40}
+    def diff(self, repo, number, sha, base_sha):
         return 'diff text'
 
 class FakeModel:

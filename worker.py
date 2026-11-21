@@ -15,7 +15,7 @@ from repo_config import allowed
 ACTIONS = frozenset({'opened', 'reopened', 'synchronize', 'ready_for_review'})
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 MAX_DIFF = 1024 * 1024
-MAX_REVIEW = 100_000
+MAX_REVIEW = 65536
 
 
 def wiki_evidence(root, query=''):
@@ -164,6 +164,7 @@ class Worker:
         return result
 
     def process(self, body):
+        policy = allowed(self.repos)
         try:
             event = json.loads(body)
             repo = event['repository']['full_name']
@@ -171,28 +172,38 @@ class Worker:
             pr = event['pull_request']
             number = event['number']
             sha = pr['head']['sha']
-            if (type(repo_id) is not int or allowed(self.repos).get(repo_id) != repo or event['action'] not in ACTIONS or
+            if (type(repo_id) is not int or policy.get(repo_id) != repo or event['action'] not in ACTIONS or
                 type(number) is not int or number <= 0 or pr['number'] != number or
                 pr['draft'] is not False or pr['state'] != 'open' or
                 not isinstance(sha, str) or not SHA.fullmatch(sha)):
                 return {'status': 'skipped', 'reason': 'ineligible event'}
         except (ValueError, KeyError, TypeError):
             return {'status': 'skipped', 'reason': 'invalid event'}
-        def eligible():
+        def eligible(base_sha=None):
             if allowed(self.repos).get(repo_id) != repo:
-                return False
+                return None
             state = self.github.current(repo, number)
-            return state.get('state') == 'open' and state.get('draft') is False and state.get('sha') == sha
-        if not eligible():
+            current_base = state.get('base_sha')
+            if (state.get('state') != 'open' or state.get('draft') is not False
+                    or state.get('sha') != sha):
+                return None
+            if not isinstance(current_base, str) or not SHA.fullmatch(current_base):
+                raise ValueError('invalid base SHA')
+            if base_sha is not None and current_base != base_sha:
+                raise ValueError('base changed during review')
+            return current_base
+        base_sha = eligible()
+        if base_sha is None:
             return {'status': 'skipped', 'reason': 'stale or ineligible PR'}
-        diff = self.github.diff(repo, number, sha)
+        diff = self.github.diff(repo, number, sha, base_sha)
         if not isinstance(diff, str) or len(diff.encode('utf-8')) > MAX_DIFF:
             return {'status': 'skipped', 'reason': 'invalid or oversized diff'}
         request = {'repository': repo, 'number': number, 'sha': sha, 'diff': diff,
                    'wiki': wiki_evidence(self.wiki, diff), 'profile': 'prreview', 'model': 'gpt-6.1-terra'}
         review = self.model.review(request)
-        if not isinstance(review, str) or len(review.encode('utf-8')) > MAX_REVIEW:
+        if not isinstance(review, str) or not review.strip() or len(review.encode('utf-8')) > MAX_REVIEW:
             raise ValueError('invalid review')
-        if not eligible():
+        if eligible(base_sha) is None:
             return {'status': 'skipped', 'reason': 'stale or ineligible PR'}
-        return {'status': 'done', 'repository': repo, 'number': number, 'sha': sha, 'review': review}
+        return {'status': 'done', 'repository': repo, 'number': number, 'sha': sha,
+                'base_sha': base_sha, 'review': review}

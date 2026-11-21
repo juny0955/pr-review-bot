@@ -61,21 +61,28 @@ class GitHubReadOnly:
         endpoint = _endpoint(repo, number, self.repos)
         obj = json.loads(_gh_get(endpoint, 'application/vnd.github+json', MAX_METADATA))
         repo_id = obj['base']['repo']['id']
-        if type(repo_id) is not int or allowed(self.repos).get(repo_id) != repo:
+        repo_name = obj['base']['repo']['full_name']
+        if type(repo_id) is not int or repo_name != repo or allowed(self.repos).get(repo_id) != repo:
             raise ValueError('GitHub repository identity mismatch')
         state, draft, sha = obj['state'], obj['draft'], obj['head']['sha']
-        if state not in ('open', 'closed') or type(draft) is not bool or not isinstance(sha, str) or not SHA.fullmatch(sha):
+        base_sha = obj['base']['sha']
+        if (state not in ('open', 'closed') or type(draft) is not bool
+                or not isinstance(sha, str) or not SHA.fullmatch(sha)
+                or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
             raise ValueError('invalid GitHub PR response')
-        return {'state': state, 'draft': draft, 'sha': sha}
+        return {'state': state, 'draft': draft, 'sha': sha, 'base_sha': base_sha,
+                'repo_id': repo_id, 'repo': repo_name}
 
-    def diff(self, repo, number, sha):
+    def diff(self, repo, number, sha, base_sha):
         endpoint = _endpoint(repo, number, self.repos)
-        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        if (not isinstance(sha, str) or not SHA.fullmatch(sha)
+                or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
             raise ValueError('invalid SHA')
-        expected = {'state': 'open', 'draft': False, 'sha': sha}
-        if self.current(repo, number) != expected:
+        expected = self.current(repo, number)
+        if (expected.get('state') != 'open' or expected.get('draft') is not False
+                or expected.get('sha') != sha or expected.get('base_sha') != base_sha):
             raise ValueError('stale or ineligible pull request')
-        data = _gh_get(endpoint, 'application/vnd.github.v3.diff', MAX_DIFF)
-        if self.current(repo, number) != expected:
-            raise ValueError('stale or ineligible pull request')
-        return data.decode('utf-8')
+        # The PR diff endpoint is mutable and pre/post checks cannot exclude ABA.
+        # A compare of current base/head is not necessarily the PR's historical
+        # merge-base diff. Do not review until a pinned equivalent is available.
+        raise RuntimeError('immutable pull request diff unavailable')

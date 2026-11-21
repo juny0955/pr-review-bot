@@ -9,12 +9,35 @@ REPO = 'example-owner/example-repo'
 
 
 class AdapterTests(unittest.TestCase):
+    def test_readonly_current_supplies_publisher_verified_identity(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import Mock
+        from publisher import GitHubPublisher
+        pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA},
+                         'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
+        with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr):
+            post = Mock()
+            publisher = GitHubPublisher(post, GitHubReadOnly({123: REPO}).current, {123: REPO},
+                                        enabled=True, ledger_path=Path(directory) / 'ledger', get=Mock())
+            self.assertEqual(publisher.publish(123, REPO, 1, SHA, 'review', base_sha='b' * 40), 'sent')
+            post.assert_called_once()
+
+    def test_diff_fails_closed_without_fetching_mutable_pr_diff(self):
+        gh = GitHubReadOnly({123: REPO})
+        current = {'state': 'open', 'draft': False, 'sha': SHA, 'base_sha': 'b' * 40}
+        with patch.object(gh, 'current', return_value=current), patch('github_adapter._gh_get') as get:
+            with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                gh.diff(REPO, 1, SHA, 'b' * 40)
+            get.assert_not_called()
+
     def test_current_and_diff_use_read_only_get_and_check_sha(self):
-        pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'repo': {'id': 123}}}).encode()
+        pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
         with patch('github_adapter._gh_get', side_effect=[pr, pr, b'diff text', pr]) as get:
             gh = GitHubReadOnly({123: REPO})
             self.assertEqual(gh.current(REPO, 1)['sha'], SHA)
-            self.assertEqual(gh.diff(REPO, 1, SHA), 'diff text')
+            with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                gh.diff(REPO, 1, SHA, 'b' * 40)
             self.assertTrue(all(call.args[0] == 'repos/example-owner/example-repo/pulls/1' for call in get.call_args_list))
 
     def test_rejects_invalid_inputs_before_network(self):
@@ -22,7 +45,7 @@ class AdapterTests(unittest.TestCase):
         with patch('github_adapter._gh_get') as get:
             for repo, number, sha in [('evil/repo', 1, SHA), (REPO, True, SHA), (REPO, 1, 'bad')]:
                 with self.subTest(repo=repo, number=number, sha=sha), self.assertRaises(ValueError):
-                    gh.diff(repo, number, sha)
+                    gh.diff(repo, number, sha, 'b' * 40)
             get.assert_not_called()
 
     def test_diff_rejects_stale_and_draft(self):
@@ -31,15 +54,8 @@ class AdapterTests(unittest.TestCase):
                       {'state': 'open', 'draft': False, 'sha': 'b' * 40}):
             with self.subTest(state=state), patch.object(gh, 'current', return_value=state), patch('github_adapter._gh_get') as get:
                 with self.assertRaises(ValueError):
-                    gh.diff(REPO, 1, SHA)
+                    gh.diff(REPO, 1, SHA, 'b' * 40)
                 get.assert_not_called()
-
-    def test_diff_rechecks_after_download(self):
-        gh = GitHubReadOnly({123: REPO})
-        current = {'state': 'open', 'draft': False, 'sha': SHA}
-        with patch.object(gh, 'current', side_effect=[current, {**current, 'sha': 'b' * 40}]), patch('github_adapter._gh_get', return_value=b'diff'):
-            with self.assertRaises(ValueError):
-                gh.diff(REPO, 1, SHA)
 
     def test_gh_process_is_get_and_caps_output(self):
         import io
