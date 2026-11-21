@@ -18,6 +18,7 @@ import sqlite3
 import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from repo_config import allowed
+from outbox import Outbox, valid_identity
 
 MAX_BODY = 1024 * 1024
 MAX_QUEUE = 1000
@@ -39,6 +40,8 @@ def create_server(secret, allowed_repos, db_path, port=8080):
         db.execute('CREATE TABLE IF NOT EXISTS queue (delivery_id TEXT PRIMARY KEY, body BLOB NOT NULL, received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
         db.execute('CREATE TABLE IF NOT EXISTS tombstone (delivery_id TEXT PRIMARY KEY, body_hash BLOB NOT NULL)')
         db.execute('CREATE INDEX IF NOT EXISTS tombstone_body_hash ON tombstone(body_hash)')
+
+    Outbox(db_path, repos=allowed_repos)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -99,7 +102,7 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                 pr = payload['pull_request']
                 sha = pr['head']['sha']
                 if (not isinstance(action, str) or action not in ('opened', 'reopened', 'synchronize', 'ready_for_review')
-                    or type(number) is not int or number <= 0
+                    or not valid_identity(repo_id, repo, number)
                     or type(pr['number']) is not int or pr['number'] != number
                     or type(pr['draft']) is not bool or pr['state'] not in ('open', 'closed')
                     or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
@@ -127,6 +130,8 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                             row = db.execute("""SELECT q.delivery_id, q.body FROM queue q JOIN work w
                                 ON w.delivery_id=q.delivery_id WHERE w.status IN ('done','skipped','failed')
                                 AND w.completed_at <= CAST(strftime('%s','now') AS INTEGER) - 7 * 86400
+                                AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.delivery_id=q.delivery_id
+                                    AND o.status IS NOT 'sent')
                                 ORDER BY w.completed_at, q.rowid LIMIT 1""").fetchone()
                             if row:
                                 db.execute('INSERT INTO tombstone(delivery_id, body_hash) VALUES (?, ?)',
@@ -136,6 +141,7 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                         if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
                             raise sqlite3.OperationalError('queue full')
                     db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
+                    db.execute("UPDATE outbox SET repo_id=?,repo_name=?,pr_number=? WHERE delivery_id=? AND event='detected'", (repo_id, repo, number, delivery))
                 return self.reply(202, 'queued')
             except sqlite3.Error:
                 return self.reply(503, 'queue unavailable')

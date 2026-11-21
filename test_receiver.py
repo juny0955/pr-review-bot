@@ -112,12 +112,63 @@ class SecurityTest(unittest.TestCase):
         worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        from outbox import Outbox
+        messages = []
+        box = Outbox(self.db, repos={123: 'acme/repo'})
+        for _ in range(3):
+            self.assertEqual(box.send_once(messages.append), 'sent')
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
         with patch('receiver.MAX_QUEUE', 1):
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'alias'}), 200)
             self.assertEqual(self.send(payload(action='reopened')), 409)
+        from outbox import Outbox
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM queue WHERE delivery_id='test-id'").fetchone())
+            self.assertEqual(db.execute("SELECT event,repo_id,repo_name,pr_number FROM outbox WHERE delivery_id='test-id' ORDER BY id").fetchall(),
+                             [('detected', 123, 'acme/repo', 1), ('started', 123, 'acme/repo', 1), ('completed', 123, 'acme/repo', 1)])
+        self.assertTrue(all('acme/repo #1' in message for message in messages))
+
+    def test_cleanup_preserves_every_unsent_outbox_source(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        assert claim is not None
+        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+        for status, name in [('failed', '@everyone'), ('pending', 'acme/repo'), ('sending', 'acme/repo'),
+                             ('pending', '@everyone'), ('failed', 'acme/repo'), ('unknown', 'acme/repo')]:
+            with self.subTest(status=status, name=name):
+                with closing(sqlite3.connect(self.db)) as db, db:
+                    db.execute("UPDATE outbox SET status='sent'")
+                    db.execute("UPDATE outbox SET status=?,repo_name=? WHERE event='started'", (status, name))
+                    before = db.execute('SELECT * FROM outbox ORDER BY id').fetchall()
+                    work = db.execute('SELECT * FROM work').fetchall()
+                with patch('receiver.MAX_QUEUE', 1):
+                    self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+                with closing(sqlite3.connect(self.db)) as db:
+                    self.assertEqual(db.execute('SELECT delivery_id,body FROM queue').fetchall(), [('test-id', payload())])
+                    self.assertEqual(db.execute('SELECT * FROM outbox ORDER BY id').fetchall(), before)
+                    self.assertEqual(db.execute('SELECT * FROM work').fetchall(), work)
+                    self.assertEqual(db.execute('SELECT count(*) FROM tombstone').fetchone()[0], 0)
+
+    def test_cleanup_preserves_unresolved_outbox_source(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        assert claim is not None
+        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+            db.execute("UPDATE outbox SET repo_name=NULL WHERE event='started'")
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertIsNotNone(db.execute("SELECT body FROM queue WHERE delivery_id='test-id'").fetchone())
 
     def test_recent_terminal_results_are_preserved(self):
         from worker import Worker
@@ -144,6 +195,7 @@ class SecurityTest(unittest.TestCase):
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
+            db.execute("UPDATE outbox SET status='sent'")
             before = db.execute('SELECT * FROM work').fetchall()
             db.execute("CREATE TRIGGER reject_insert BEFORE INSERT ON queue BEGIN SELECT RAISE(ABORT, 'fail'); END")
         with patch('receiver.MAX_QUEUE', 1):
@@ -164,6 +216,7 @@ class SecurityTest(unittest.TestCase):
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
+            db.execute("UPDATE outbox SET status='sent'")
             db.execute("CREATE TRIGGER reject_cleanup BEFORE DELETE ON queue BEGIN SELECT RAISE(ABORT, 'fail'); END")
         with patch('receiver.MAX_QUEUE', 1):
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
