@@ -19,24 +19,18 @@ from repo_config import allowed
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 
 
-def _require_revocation_gate():
-    # ponytail: no safe shared revocation gate exists; keep live posting disabled.
-    raise ValueError('publication disabled: no shared revocation gate')
+def _require_operational_isolation():
+    # ponytail: no override until publisher/admin isolation and bypass prevention are verified.
+    raise ValueError('publication disabled: operational isolation not implemented')
 
 
-class GitHubPublisher:
-    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None):
-        if type(enabled) is not bool:
-            raise ValueError('enabled must be boolean')
-        allowed(repos)
-        self.post = post
-        self.current = current
-        self.repos = repos
-        self.enabled = enabled
-        self.ledger_path = ledger_path
-        self.get = get
+def _require_revocation_gate(path, identity):
+    from revocation_gate import authorize
+    return authorize(path, identity)
 
-    def publish(self, repo_id, repo, number, sha, review, *, base_sha=None):
+
+def _guard_publish(publish_locked):
+    def guarded(self, repo_id, repo, number, sha, review, base_sha):
         if (type(repo_id) is not int or not isinstance(repo, str) or allowed(self.repos).get(repo_id) != repo
                 or type(number) is not int or number <= 0):
             raise ValueError('repository or pull request not allowed')
@@ -48,7 +42,32 @@ class GitHubPublisher:
             raise ValueError('invalid review')
         if not self.enabled:
             return 'dry_run'
-        _require_revocation_gate()
+        _require_operational_isolation()
+        identity = [repo_id, repo, number, sha, base_sha, hashlib.sha256(review.encode('utf-8')).hexdigest()]
+        # ponytail: one global lock serializes all posts; shard only if throughput requires it.
+        with _require_revocation_gate(self.gate_path, identity):
+            return publish_locked(self, repo_id, repo, number, sha, review, base_sha)
+    return guarded
+
+
+class GitHubPublisher:
+    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None, gate_path=None):
+        if type(enabled) is not bool:
+            raise ValueError('enabled must be boolean')
+        allowed(repos)
+        self.post = post
+        self.current = current
+        self.repos = repos
+        self.enabled = enabled
+        self.ledger_path = ledger_path
+        self.get = get
+        self.gate_path = gate_path
+
+    def publish(self, repo_id, repo, number, sha, review, *, base_sha=None):
+        return self._publish_locked(repo_id, repo, number, sha, review, base_sha)
+
+    @_guard_publish
+    def _publish_locked(self, repo_id, repo, number, sha, review, base_sha):
         actual = self.current(repo, number)
         if (not isinstance(actual, dict) or type(actual.get('repo_id')) is not int
                 or actual.get('repo_id') != repo_id or actual.get('repo') != repo
