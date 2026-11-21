@@ -4,6 +4,12 @@ import os
 import selectors
 import subprocess
 import time
+import tempfile
+import sys
+import signal
+import ctypes
+import stat
+from contextlib import ExitStack
 
 from worker import MAX_DIFF, SHA
 from repo_config import allowed
@@ -46,6 +52,108 @@ def _gh_get(endpoint, accept, limit):
         proc.stdout.close()
 
 
+MAX_GIT_FILE = 64 * 1024 * 1024
+GIT_TIMEOUT = 60
+MAX_GIT_STORAGE = 256 * 1024 * 1024
+
+
+def _bounded_git_root():
+    """Validate the one administrator-provisioned scratch mount, or fail closed."""
+    path = '/run/pr-review-bot-diff'
+    if os.environ.get('PR_DIFF_TMPDIR') != path:
+        raise RuntimeError('bounded git scratch unavailable: invalid path')
+    try:
+        for parent in ('/', '/run'):
+            info = os.lstat(parent)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('untrusted parent')
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            visible = os.lstat(path)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077 or (info.st_dev, info.st_ino) != (visible.st_dev, visible.st_ino)
+                    or not os.path.ismount(path)):
+                raise ValueError('untrusted mount')
+            buf = ctypes.create_string_buffer(256)
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.fstatfs(fd, ctypes.byref(buf)) != 0:
+                raise OSError(ctypes.get_errno(), 'fstatfs failed')
+            size = os.fstatvfs(fd)
+            if ctypes.c_long.from_buffer(buf).value != 0x01021994 or not 0 < size.f_blocks * size.f_frsize <= MAX_GIT_STORAGE:
+                raise ValueError('unbounded or non-tmpfs mount')
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, AttributeError) as exc:
+        raise RuntimeError('bounded git scratch unavailable') from exc
+    return path
+
+
+def _pinned_diff(remote, number, sha, base_sha):
+    """Fetch into an isolated bare repository and diff immutable commit objects."""
+    deadline = time.monotonic() + GIT_TIMEOUT
+    with ExitStack() as stack:
+        root = _bounded_git_root()
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        stack.callback(os.close, root_fd)
+        directory = stack.enter_context(tempfile.TemporaryDirectory(prefix='pr-diff-', dir=root))
+        opened, visible = os.fstat(root_fd), os.lstat(root)
+        if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
+            raise RuntimeError('bounded git scratch changed')
+        env = {'PATH': os.defpath, 'HOME': directory, 'XDG_CONFIG_HOME': directory,
+               'TMPDIR': directory,
+               'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
+               'GIT_ATTR_NOSYSTEM': '1', 'LC_ALL': 'C',
+               'GH_CONFIG_DIR': os.path.expanduser('~/.config/gh')}
+        for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        def run(args, limit=4096):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('git timed out')
+            with tempfile.TemporaryFile(dir=directory) as output:
+                cmd = ['git', '-c', 'core.hooksPath=/dev/null',
+                       '-c', 'protocol.ext.allow=never', '-c', 'diff.external=',
+                       '-c', 'credential.helper=',
+                       '-c', 'credential.helper=!gh auth git-credential', *args]
+                proc = subprocess.Popen([sys.executable, '-I', os.path.join(os.path.dirname(__file__),
+                                         'git_limited_exec.py'), str(MAX_GIT_FILE), str(GIT_TIMEOUT), *cmd],
+                                        cwd=directory, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=output, stderr=subprocess.DEVNULL, start_new_session=True)
+                try:
+                    proc.wait(timeout=remaining)
+                except BaseException as exc:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    finally:
+                        proc.wait()
+                    if isinstance(exc, subprocess.TimeoutExpired):
+                        raise TimeoutError('git timed out') from exc
+                    raise
+                if proc.returncode:
+                    raise RuntimeError('git command failed')
+                if output.tell() > limit:
+                    raise ValueError('git output too large')
+                output.seek(0)
+                return output.read()
+        run(['init', '--bare', '-q', 'repo.git'])
+        gitdir = '--git-dir=' + os.path.join(directory, 'repo.git')
+        run([gitdir, 'fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules',
+             remote, f'+refs/pull/{number}/head:refs/pr/head', base_sha])
+        actual = run([gitdir, 'rev-parse', '--verify', 'refs/pr/head^{commit}']).decode().strip()
+        if actual != sha:
+            raise ValueError('pull request head changed')
+        run([gitdir, 'cat-file', '-e', base_sha + '^{commit}'])
+        bases = run([gitdir, 'merge-base', '--all', base_sha, sha]).decode().splitlines()
+        if len(bases) != 1 or not SHA.fullmatch(bases[0]):
+            raise ValueError('expected exactly one merge base')
+        return run([gitdir, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+                    '--no-color', bases[0], sha, '--'], MAX_DIFF).decode('utf-8', 'strict')
+
+
 def _endpoint(repo, number, repos):
     if repo not in allowed(repos).values() or type(number) is not int or number <= 0:
         raise ValueError('repository or pull request not allowed')
@@ -82,7 +190,4 @@ class GitHubReadOnly:
         if (expected.get('state') != 'open' or expected.get('draft') is not False
                 or expected.get('sha') != sha or expected.get('base_sha') != base_sha):
             raise ValueError('stale or ineligible pull request')
-        # The PR diff endpoint is mutable and pre/post checks cannot exclude ABA.
-        # A compare of current base/head is not necessarily the PR's historical
-        # merge-base diff. Do not review until a pinned equivalent is available.
-        raise RuntimeError('immutable pull request diff unavailable')
+        return _pinned_diff('https://github.com/' + repo + '.git', number, sha, base_sha)
