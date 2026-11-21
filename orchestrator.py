@@ -9,6 +9,7 @@ import threading
 from github_adapter import GitHubReadOnly
 from model_adapter import resolve_hermes_direct_adapter
 from notification import DiscordNotifier, DiscordTransport
+from outbox import Outbox
 from repo_config import allowed
 from worker import Worker
 
@@ -16,6 +17,22 @@ from worker import Worker
 def _status(value):
     # Never serialize adapter exceptions, job contents, or model output.
     print(json.dumps({'status': value}), flush=True)
+
+
+def deliver_notification(notifier, channel, content):
+    if notifier.notify(channel, content) != 'sent':
+        raise ValueError('notification not sent')
+
+
+def notification_loop(outbox, notifier, channel, stop, *, poll_interval=5):
+    while not stop.is_set():
+        try:
+            result = outbox.send_once(lambda content: deliver_notification(notifier, channel, content))
+        except Exception:
+            _status('notification_error')
+            result = None
+        if result is None:
+            stop.wait(poll_interval)
 
 
 def run_loop(worker, stop, *, notifier=None, channel=None, poll_interval=5, max_backoff=60):
@@ -79,7 +96,17 @@ def main(argv=None):
         try:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 previous[sig] = signal.signal(sig, request_stop)
-            run_loop(worker, stop, notifier=notifier, channel=channel)
+            thread = None
+            if notifier is not None:
+                thread = threading.Thread(target=notification_loop,
+                                          args=(Outbox(str(db), repos=args.repos), notifier, channel, stop))
+                thread.start()
+            try:
+                run_loop(worker, stop)
+            finally:
+                stop.set()
+                if thread is not None:
+                    thread.join()
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)

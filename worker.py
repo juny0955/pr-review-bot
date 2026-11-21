@@ -11,6 +11,7 @@ import time
 import uuid
 
 from repo_config import allowed
+from outbox import Outbox
 
 ACTIONS = frozenset({'opened', 'reopened', 'synchronize', 'ready_for_review'})
 SHA = re.compile(r'[0-9a-f]{40}\Z')
@@ -89,6 +90,7 @@ class Worker:
         self.repos = repos
         self.db_path, self.github, self.model, self.wiki = db_path, github, model, wiki
         self.lease_seconds, self.clock = lease_seconds, clock
+        Outbox(db_path, clock=clock, repos=repos)
         with closing(sqlite3.connect(db_path, timeout=5)) as db, db:
             db.execute('BEGIN IMMEDIATE')
             db.execute('''CREATE TABLE IF NOT EXISTS work (
@@ -102,6 +104,7 @@ class Worker:
             if 'completed_at' not in columns:
                 db.execute('ALTER TABLE work ADD COLUMN completed_at REAL')
                 db.execute("UPDATE work SET completed_at=? WHERE status IN ('done','skipped','failed')", (self.clock(),))
+            Outbox.install_work_triggers(db)
 
     def claim(self):
         token = uuid.uuid4().hex
