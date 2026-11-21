@@ -167,7 +167,7 @@ class AdapterTests(unittest.TestCase):
                          'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
         # Exercise the dormant publisher path with fake transports only.
         with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr), \
-             patch('publisher._require_revocation_gate'):
+             patch('publisher._require_revocation_gate'), patch('publisher._require_operational_isolation'):
             post = Mock()
             publisher = GitHubPublisher(post, GitHubReadOnly({123: REPO}).current, {123: REPO},
                                         enabled=True, ledger_path=Path(directory) / 'ledger', get=Mock())

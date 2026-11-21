@@ -34,7 +34,17 @@ class PublishWorkerTests(unittest.TestCase):
             self.publish(enabled=True)
         self.post.assert_not_called()
 
+    def test_enabled_fails_closed_without_operational_isolation(self):
+        with self.assertRaisesRegex(ValueError, 'operational isolation'):
+            self.publish(enabled=True, gate_path='/validity-does-not-bypass-safety')
+        self.current.assert_not_called()
+        self.post.assert_not_called()
+
     def setUp(self):
+        if self._testMethodName != 'test_enabled_fails_closed_without_operational_isolation':
+            isolation = patch('publisher._require_operational_isolation')
+            isolation.start()
+            self.addCleanup(isolation.stop)
         if self._testMethodName != 'test_enabled_must_fail_closed_without_revocation_gate':
             gate = patch('publisher._require_revocation_gate')
             gate.start()

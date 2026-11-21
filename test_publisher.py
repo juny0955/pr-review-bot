@@ -13,6 +13,31 @@ def fresh(**overrides):
                  'repo_id': ID, 'repo': REPO, 'base_sha': 'b' * 40}, **overrides)
 
 
+class DirectEntrySafetyTests(unittest.TestCase):
+    def test_direct_locked_call_cannot_bypass_safety(self):
+        import tempfile
+        from pathlib import Path
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                post, current = Mock(), Mock(return_value=fresh())
+                publisher = GitHubPublisher(post, current, POLICY, enabled=enabled,
+                                            ledger_path=Path(directory) / 'ledger', get=Mock(return_value=[]))
+                if enabled:
+                    with self.assertRaisesRegex(ValueError, 'operational isolation'):
+                        publisher._publish_locked(ID, REPO, 1, SHA, 'review', 'b' * 40)
+                else:
+                    self.assertEqual(publisher._publish_locked(ID, REPO, 1, SHA, 'review', 'b' * 40), 'dry_run')
+                current.assert_not_called()
+                post.assert_not_called()
+
+    def test_direct_locked_call_still_requires_gate(self):
+        post = Mock()
+        publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True)
+        with patch('publisher._require_operational_isolation'), self.assertRaisesRegex(ValueError, 'no shared revocation gate'):
+            publisher._publish_locked(ID, REPO, 1, SHA, 'review', 'b' * 40)
+        post.assert_not_called()
+
+
 class PublisherTests(unittest.TestCase):
     def test_enabled_fails_closed_without_revocation_gate(self):
         import tempfile
@@ -26,6 +51,9 @@ class PublisherTests(unittest.TestCase):
         post.assert_not_called()
 
     def setUp(self):
+        isolation = patch('publisher._require_operational_isolation')
+        isolation.start()
+        self.addCleanup(isolation.stop)
         if self._testMethodName != 'test_enabled_fails_closed_without_revocation_gate':
             gate = patch('publisher._require_revocation_gate')
             gate.start()
@@ -98,6 +126,9 @@ class PublisherTests(unittest.TestCase):
 class LedgerTests(unittest.TestCase):
     def setUp(self):
         # Exercise dormant ledger code only; no real transport is used.
+        isolation = patch('publisher._require_operational_isolation')
+        isolation.start()
+        self.addCleanup(isolation.stop)
         gate = patch('publisher._require_revocation_gate')
         gate.start()
         self.addCleanup(gate.stop)

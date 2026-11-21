@@ -1,10 +1,7 @@
 """Publish a stored worker result by delivery ID, independently of notifications.
 
-The approval callback is a trusted public-release decision for the exact review
-and identity supplied, not merely permission to send data to the model. It must
-return the boolean True; absence, failure, or any other result blocks posting.
-Live publishing is disabled until revocation and posting share a gate. Separate
-least-privilege GitHub credentials are an operational requirement, not enforced here.
+The approval callback is only an additional veto, never evidence for the gate.
+Live publication is disabled until operational isolation is implemented and verified.
 Queue retention may delete old results, which then fail closed.
 """
 from contextlib import closing
@@ -16,7 +13,7 @@ from worker import ACTIONS
 
 
 def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=None,
-                          ledger_path=None, enabled=False, approve=None):
+                          ledger_path=None, enabled=False, approve=None, gate_path=None):
     if type(enabled) is not bool:
         raise ValueError('enabled must be boolean')
     with closing(sqlite3.connect(db_path, timeout=5)) as db:
@@ -45,7 +42,7 @@ def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=Non
     except (KeyError, TypeError, ValueError, RecursionError) as exc:
         raise ValueError('invalid worker result or event') from exc
     publisher = GitHubPublisher(post, current, repos, enabled=enabled,
-                                ledger_path=ledger_path, get=get)
+                                ledger_path=ledger_path, get=get, gate_path=gate_path)
     if enabled and (not callable(approve) or approve(repo_id, repo, number, sha, base, review) is not True):
         raise ValueError('public release not approved')
     return publisher.publish(repo_id, repo, number, sha, review, base_sha=base)
