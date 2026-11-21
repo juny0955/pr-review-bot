@@ -106,6 +106,86 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'other'}), 200)
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
 
+    def test_completed_work_cleanup_preserves_replay_and_delivery_conflict(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
+            self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'alias'}), 200)
+            self.assertEqual(self.send(payload(action='reopened')), 409)
+
+    def test_recent_terminal_results_are_preserved(self):
+        from worker import Worker
+        for status in ('done', 'failed', 'skipped'):
+            with self.subTest(status=status):
+                body = payload(action='opened' if status == 'done' else 'reopened', number=1 if status != 'skipped' else 2,
+                               pull_request={'number': 1 if status != 'skipped' else 2, 'draft': False, 'state': 'open', 'head': {'sha': 'a' * 40}})
+                delivery = status
+                self.assertEqual(self.send(body, {'X-GitHub-Delivery': delivery}), 202)
+                worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+                claim = worker.claim()
+                self.assertTrue(worker.finish(claim[0], claim[2], status, {'status': status}))
+                with patch('receiver.MAX_QUEUE', 1):
+                    self.assertEqual(self.send(payload(action='synchronize'), {'X-GitHub-Delivery': 'new'}), 503)
+                with closing(sqlite3.connect(self.db)) as db, db:
+                    self.assertEqual(db.execute('SELECT status FROM work').fetchone()[0], status)
+                    db.execute('DELETE FROM work'); db.execute('DELETE FROM queue')
+
+    def test_insert_integrity_error_rolls_back_cleanup(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+            before = db.execute('SELECT * FROM work').fetchall()
+            db.execute("CREATE TRIGGER reject_insert BEFORE INSERT ON queue BEGIN SELECT RAISE(ABORT, 'fail'); END")
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+            with closing(sqlite3.connect(self.db)) as db, db:
+                self.assertEqual(db.execute('SELECT delivery_id, body FROM queue').fetchall(), [('test-id', payload())])
+                self.assertEqual(db.execute('SELECT * FROM work').fetchall(), before)
+                self.assertEqual(db.execute('SELECT count(*) FROM tombstone').fetchone()[0], 0)
+                db.execute('DROP TRIGGER reject_insert')
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
+
+    def test_cleanup_rollback_and_restart_preserve_replay(self):
+        from worker import Worker
+        from receiver import create_server
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+            db.execute("CREATE TRIGGER reject_cleanup BEFORE DELETE ON queue BEGIN SELECT RAISE(ABORT, 'fail'); END")
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+            with closing(sqlite3.connect(self.db)) as db, db:
+                self.assertEqual(db.execute('SELECT count(*) FROM tombstone').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT count(*) FROM work').fetchone()[0], 1)
+                db.execute('DROP TRIGGER reject_cleanup')
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
+            server = create_server('secret', {123: 'acme/repo'}, self.db, port=0)
+            server.server_close()
+            self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'alias'}), 200)
+
+    def test_full_queue_never_evicts_running_or_retry_work(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+            self.assertTrue(worker.finish(claim[0], claim[2], 'retry', {'status': 'retry'}))
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+
     def test_existing_database_permissions_are_restricted(self):
         from receiver import create_server
         import os

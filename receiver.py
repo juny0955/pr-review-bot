@@ -1,4 +1,13 @@
-"""Local-only GitHub pull request webhook intake; no outbound operations."""
+"""Local-only GitHub pull request webhook intake; no outbound operations.
+
+At capacity, terminal work at least seven days old is replaced transactionally with permanent SHA-256
+tombstones. This bounds queue rows, not tombstone or SQLite disk usage; backups
+and disk monitoring are operator responsibilities. Results can be deleted at
+capacity after the retention period. A restored or deleted database loses replay history since its backup.
+The signature authenticates the body, not the delivery ID; tombstones cannot
+prevent replay after database loss or protect against a compromised secret.
+Pending, retrying, and leased work is never evicted; saturation returns 503.
+"""
 from contextlib import closing
 import hashlib
 import hmac
@@ -28,6 +37,8 @@ def create_server(secret, allowed_repos, db_path, port=8080):
         os.close(fd)
     with closing(sqlite3.connect(db_path)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS queue (delivery_id TEXT PRIMARY KEY, body BLOB NOT NULL, received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+        db.execute('CREATE TABLE IF NOT EXISTS tombstone (delivery_id TEXT PRIMARY KEY, body_hash BLOB NOT NULL)')
+        db.execute('CREATE INDEX IF NOT EXISTS tombstone_body_hash ON tombstone(body_hash)')
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -101,15 +112,30 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                     previous = db.execute('SELECT body FROM queue WHERE delivery_id = ?', (delivery,)).fetchone()
                     if previous is not None:
                         return self.reply(200 if previous[0] == body else 409, 'duplicate' if previous[0] == body else 'delivery conflict')
+                    digest = hashlib.sha256(body).digest()
+                    previous = db.execute('SELECT body_hash FROM tombstone WHERE delivery_id=?', (delivery,)).fetchone()
+                    if previous is not None:
+                        return self.reply(200 if previous[0] == digest else 409, 'duplicate' if previous[0] == digest else 'delivery conflict')
                     if db.execute('SELECT 1 FROM queue WHERE body = ? LIMIT 1', (body,)).fetchone():
                         return self.reply(200, 'duplicate')
+                    if db.execute('SELECT 1 FROM tombstone WHERE body_hash=? LIMIT 1', (digest,)).fetchone():
+                        return self.reply(200, 'duplicate')
                     if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
-                        return self.reply(503, 'queue full')
-                    try:
-                        db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
-                    except sqlite3.IntegrityError:
-                        previous = db.execute('SELECT body FROM queue WHERE delivery_id = ?', (delivery,)).fetchone()
-                        return self.reply(200 if previous and previous[0] == body else 409, 'duplicate' if previous and previous[0] == body else 'delivery conflict')
+                        # ponytail: evict one expired terminal result only when full;
+                        # tombstones grow indefinitely to preserve replay defense.
+                        if 'completed_at' in {r[1] for r in db.execute('PRAGMA table_info(work)')}:
+                            row = db.execute("""SELECT q.delivery_id, q.body FROM queue q JOIN work w
+                                ON w.delivery_id=q.delivery_id WHERE w.status IN ('done','skipped','failed')
+                                AND w.completed_at <= CAST(strftime('%s','now') AS INTEGER) - 7 * 86400
+                                ORDER BY w.completed_at, q.rowid LIMIT 1""").fetchone()
+                            if row:
+                                db.execute('INSERT INTO tombstone(delivery_id, body_hash) VALUES (?, ?)',
+                                           (row[0], hashlib.sha256(row[1]).digest()))
+                                db.execute('DELETE FROM work WHERE delivery_id=?', (row[0],))
+                                db.execute('DELETE FROM queue WHERE delivery_id=?', (row[0],))
+                        if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
+                            raise sqlite3.OperationalError('queue full')
+                    db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
                 return self.reply(202, 'queued')
             except sqlite3.Error:
                 return self.reply(503, 'queue unavailable')
