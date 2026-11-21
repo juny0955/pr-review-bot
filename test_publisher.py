@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from publisher import GitHubPublisher
 
 REPO = 'example-owner/example-repo'
@@ -14,6 +14,23 @@ def fresh(**overrides):
 
 
 class PublisherTests(unittest.TestCase):
+    def test_enabled_fails_closed_without_revocation_gate(self):
+        import tempfile
+        from pathlib import Path
+        post = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'no shared revocation gate'):
+                GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                ledger_path=Path(directory) / 'ledger', get=Mock()).publish(
+                    ID, REPO, 1, SHA, 'review', base_sha='b' * 40)
+        post.assert_not_called()
+
+    def setUp(self):
+        if self._testMethodName != 'test_enabled_fails_closed_without_revocation_gate':
+            gate = patch('publisher._require_revocation_gate')
+            gate.start()
+            self.addCleanup(gate.stop)
+
     def test_rejects_changed_or_missing_base_without_post(self):
         import tempfile
         from pathlib import Path
@@ -79,6 +96,11 @@ class PublisherTests(unittest.TestCase):
 
 
 class LedgerTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise dormant ledger code only; no real transport is used.
+        gate = patch('publisher._require_revocation_gate')
+        gate.start()
+        self.addCleanup(gate.stop)
     def test_new_claim_blocks_legacy_claim_before_post(self):
         from contextlib import closing
         import hashlib, json, sqlite3, tempfile
