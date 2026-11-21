@@ -1,0 +1,5 @@
+{
+  "repositories": [
+    {"id": 123456789, "full_name": "example-owner/example-repo", "enabled": false}
+  ]
+}
