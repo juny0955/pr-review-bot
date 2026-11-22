@@ -177,6 +177,8 @@ class GitHubReadOnly:
             repo_id = next(ident for ident, name in allowed(self.repos).items() if name == repo)
             token, _ = self.auth.token(repo_id, repo)
             obj = read_transport(token, '/' + endpoint)
+        if type(obj.get('number')) is not int or obj['number'] != number:
+            raise ValueError('GitHub pull request identity mismatch')
         repo_id = obj['base']['repo']['id']
         repo_name = obj['base']['repo']['full_name']
         if type(repo_id) is not int or repo_name != repo or allowed(self.repos).get(repo_id) != repo:

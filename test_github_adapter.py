@@ -9,6 +9,44 @@ REPO = 'example-owner/example-repo'
 
 
 class AdapterTests(unittest.TestCase):
+    def test_current_rejects_missing_or_mismatched_pr_number(self):
+        from unittest.mock import Mock
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
+              'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}
+        for auth in (None, Mock(permission='read', token=Mock(return_value=('fake', 0)))):
+            for number in (None, True, '1', 2, 1):
+                response = dict(pr)
+                if number is None:
+                    del response['number']
+                else:
+                    response['number'] = number
+                with self.subTest(app=auth is not None, number=number), \
+                     patch('github_adapter._gh_get', return_value=json.dumps(response).encode()), \
+                     patch('github_adapter.read_transport', return_value=response):
+                    adapter = GitHubReadOnly({123: REPO}, auth=auth)
+                    if type(number) is int and number == 1:
+                        self.assertEqual(adapter.current(REPO, 1)['sha'], SHA)
+                    else:
+                        with self.assertRaises(ValueError):
+                            adapter.current(REPO, 1)
+
+    def test_app_diff_never_uses_ambient_credentials_or_network(self):
+        from unittest.mock import Mock
+        auth = Mock(permission='read')
+        adapter = GitHubReadOnly({123: REPO}, auth=auth)
+        with patch('github_adapter._pinned_diff') as git, \
+             patch('github_adapter._gh_get') as gh, \
+             patch('github_adapter.read_transport') as transport, \
+             patch.object(adapter, 'current') as current:
+            for head, base in ((SHA, 'b' * 40), ('invalid', 'invalid')):
+                with self.subTest(head=head), self.assertRaisesRegex(RuntimeError, '^App-authenticated diff unavailable$'):
+                    adapter.diff(REPO, 1, head, base)
+            auth.token.assert_not_called()
+            git.assert_not_called()
+            gh.assert_not_called()
+            transport.assert_not_called()
+            current.assert_not_called()
+
     def test_real_dedicated_mount_is_accepted(self):
         import os
         from github_adapter import _bounded_git_root
@@ -163,7 +201,7 @@ class AdapterTests(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import Mock
         from publisher import GitHubPublisher
-        pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA},
+        pr = json.dumps({'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
                          'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
         # Exercise the dormant publisher path with fake transports only.
         with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr), \
@@ -216,7 +254,7 @@ class AdapterTests(unittest.TestCase):
             get.assert_not_called()
 
     def test_current_reads_pr_metadata(self):
-        pr = json.dumps({'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
+        pr = json.dumps({'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
         with patch('github_adapter._gh_get', return_value=pr) as get:
             gh = GitHubReadOnly({123: REPO})
             self.assertEqual(gh.current(REPO, 1)['sha'], SHA)
