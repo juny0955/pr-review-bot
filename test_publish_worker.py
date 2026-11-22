@@ -1,5 +1,7 @@
 from contextlib import closing
 import json
+import hashlib
+import hmac
 import sqlite3
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from publish_worker import publish_worker_result
+from worker import mode_provenance
 
 REPO, HEAD, BASE = 'owner/repo', 'a' * 40, 'b' * 40
 EVENT = {'repository': {'id': 1, 'full_name': REPO}, 'number': 7,
@@ -19,7 +22,7 @@ RESULT = {'status': 'done', 'repo_id': 1, 'repository': REPO, 'number': 7, 'sha'
 class PublishWorkerTests(unittest.TestCase):
     def test_mvp_requires_signed_event_and_exact_repository(self):
         with self.assertRaises(ValueError):
-            self.publish(enabled=True, single_vps_mvp=True, webhook_secret='synthetic')
+            self.publish(enabled=True, single_vps_mvp=True, webhook_secret='wrong')
         self.post.assert_not_called()
 
     def test_replaced_event_id_and_legacy_result_fail_closed(self):
@@ -60,9 +63,12 @@ class PublishWorkerTests(unittest.TestCase):
         self.ledger = str(Path(self.tmp.name) / 'ledger')
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
-            db.execute('CREATE TABLE work (delivery_id TEXT PRIMARY KEY, status TEXT, result TEXT)')
-            db.execute('INSERT INTO queue VALUES (?,?)', ('id', json.dumps(EVENT)))
-            db.execute('INSERT INTO work VALUES (?,?,?)', ('id', 'done', json.dumps(RESULT)))
+            db.execute('CREATE TABLE work (delivery_id TEXT PRIMARY KEY, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT)')
+            db.execute('CREATE TABLE webhook_signatures (delivery_id TEXT, signature TEXT)')
+            body = json.dumps(EVENT).encode()
+            db.execute('INSERT INTO queue VALUES (?,?)', ('id', body))
+            db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('id', 'sha256=' + hmac.new(b'synthetic', body, hashlib.sha256).hexdigest()))
+            db.execute('INSERT INTO work VALUES (?,?,?,?,?,?)', ('id', 'done', json.dumps(RESULT), 1, 1, mode_provenance('synthetic', 'id', body, 1, 1)))
         self.post = Mock()
         self.current = Mock(return_value={'repo_id': 1, 'repo': REPO, 'state': 'open',
                                           'draft': False, 'sha': HEAD, 'base_sha': BASE})
@@ -70,7 +76,7 @@ class PublishWorkerTests(unittest.TestCase):
 
     def publish(self, **kw):
         options = dict(post=self.post, current=self.current, get=Mock(return_value=[]),
-                       repos={1: REPO}, ledger_path=self.ledger, approve=self.approve)
+                       repos={1: REPO}, ledger_path=self.ledger, approve=self.approve, webhook_secret='synthetic')
         options.update(kw)
         return publish_worker_result(self.db, 'id', **options)
 

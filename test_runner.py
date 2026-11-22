@@ -11,6 +11,26 @@ from test_worker import FakeGH, FakeModel, payload
 
 
 class RunnerTest(unittest.TestCase):
+    def test_retry_uses_configured_secret_and_holds_without_it(self):
+        from runner import run_once
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'queue'
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
+                conn.execute('INSERT INTO queue VALUES (?,?)', ('one', json.dumps(payload()).encode()))
+            class Broken:
+                def current(self, *args):
+                    raise ValueError('synthetic failure')
+            args = (db, directory, {123: 'example-owner/example-repo'})
+            with patch.dict('os.environ', {'WEBHOOK_SECRET': 'synthetic'}, clear=True):
+                self.assertEqual(run_once(*args, github=Broken(), model=FakeModel())['status'], 'retry')
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('UPDATE work SET next_attempt_at=0')
+            with patch.dict('os.environ', {}, clear=True):
+                self.assertIsNone(run_once(*args, github=FakeGH(), model=FakeModel()))
+            with patch.dict('os.environ', {'WEBHOOK_SECRET': 'synthetic'}, clear=True):
+                self.assertEqual(run_once(*args, github=FakeGH(), model=FakeModel())['status'], 'done')
+
     def test_injected_run_persists_one_result(self):
         from runner import run_once
         with tempfile.TemporaryDirectory() as directory:

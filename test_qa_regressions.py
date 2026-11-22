@@ -31,8 +31,8 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             db = os.path.join(root, 'queue')
             with contextlib.closing(sqlite3.connect(db)) as conn, conn:
-                conn.execute('CREATE TABLE work(delivery_id TEXT, status TEXT)')
-                conn.executemany('INSERT INTO work VALUES (?, ?)', [('bad', 'done'), ('good', 'done')])
+                conn.execute('CREATE TABLE work(delivery_id TEXT, status TEXT, publish_eligible INTEGER)')
+                conn.executemany('INSERT INTO work VALUES (?, ?, ?)', [('bad', 'done', 1), ('good', 'done', 1)])
             class Stop:
                 count = 0
                 def is_set(self): return self.count >= 3

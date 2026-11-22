@@ -15,10 +15,11 @@ def valid_identity(repo_id, name, number):
 
 
 class Outbox:
-    def __init__(self, db_path, *, clock=time.time, lease_seconds=60, repos=None):
+    def __init__(self, db_path, *, clock=time.time, lease_seconds=60, repos=None, webhook_secret=None):
         if lease_seconds <= 0:
             raise ValueError('invalid lease')
         self.db_path, self.clock, self.lease_seconds, self.repos = db_path, clock, lease_seconds, repos
+        self.webhook_secret = webhook_secret
         with closing(sqlite3.connect(db_path, timeout=5)) as db, db:
             db.execute('BEGIN IMMEDIATE')
             db.execute('''CREATE TABLE IF NOT EXISTS outbox (
@@ -67,7 +68,12 @@ class Outbox:
             db.execute('BEGIN IMMEDIATE')
             db.execute("UPDATE outbox SET status='failed',lease_token=NULL,lease_until=NULL WHERE status='sending' AND lease_until<=? AND attempts>=3", (now,))
             db.execute("UPDATE outbox SET status='pending',next_attempt=lease_until + CASE attempts WHEN 1 THEN 30 ELSE 60 END,lease_token=NULL,lease_until=NULL WHERE status='sending' AND lease_until<=? AND attempts<3", (now,))
-            row = db.execute("SELECT id,event,repo_id,repo_name,pr_number FROM outbox WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT 1", (now,)).fetchone()
+            columns = {r[1] for r in db.execute('PRAGMA table_info(work)')}
+            from worker import valid_mode
+            db.create_function('valid_mode', 5, lambda delivery, body, publish, notifications, mac:
+                               valid_mode(self.webhook_secret, delivery, body, publish, notifications, mac))
+            condition = "EXISTS (SELECT 1 FROM work JOIN queue q ON q.delivery_id=work.delivery_id WHERE work.delivery_id=outbox.delivery_id AND work.notifications_enabled=1 AND valid_mode(work.delivery_id,q.body,work.publish_eligible,work.notifications_enabled,work.mode_provenance))" if {'notifications_enabled', 'publish_eligible', 'mode_provenance'} <= columns else '0'
+            row = db.execute("SELECT id,event,repo_id,repo_name,pr_number FROM outbox WHERE status='pending' AND next_attempt<=? AND " + condition + " ORDER BY id LIMIT 1", (now,)).fetchone()
             if row is None:
                 return None
             db.execute("UPDATE outbox SET status='sending', attempts=attempts+1,lease_token=?,lease_until=? WHERE id=?", (token, now+self.lease_seconds, row[0]))

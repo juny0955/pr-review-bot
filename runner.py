@@ -5,6 +5,7 @@ flags. Inject both adapters into run_once for offline operation and tests.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 from github_adapter import GitHubReadOnly, app_read_auth, require_app_read_flag
@@ -18,7 +19,8 @@ def run_once(db_path, wiki, repos, *, github, model):
     path = Path(db_path)
     if path.is_symlink() or not path.is_file():
         raise ValueError('existing queue database required')
-    return Worker(str(path), github, model, wiki, repos).run_once()
+    return Worker(str(path), github, model, wiki, repos, notifications_enabled=False,
+                  webhook_secret=os.environ.get('WEBHOOK_SECRET')).run_once()
 
 
 def main(argv=None):

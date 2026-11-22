@@ -107,6 +107,44 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'other'}), 200)
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
 
+    def test_capacity_check_is_atomic_for_concurrent_deliveries(self):
+        barrier = threading.Barrier(3)
+        statuses = []
+        def send(action):
+            barrier.wait()
+            statuses.append(self.send(payload(action=action), {'X-GitHub-Delivery': action}))
+        with patch('receiver.MAX_QUEUE', 1):
+            threads = [threading.Thread(target=send, args=(action,)) for action in ('opened', 'reopened')]
+            for thread in threads: thread.start()
+            barrier.wait()
+            for thread in threads: thread.join()
+        self.assertEqual(sorted(statuses), [202, 503])
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT count(*) FROM webhook_signatures').fetchone()[0], 1)
+
+    def test_full_queue_preserves_terminal_rows_with_untrusted_modes(self):
+        from worker import Worker, mode_provenance
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
+        claim = worker.claim()
+        self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
+        for status in ('failed', 'skipped'):
+            for publish, notifications, provenance in ((None, None, None), (0, 0, None),
+                    (0, 0, '0' * 64), (1, 0, mode_provenance('secret', 'test-id', payload(), 0, 0)),
+                    (0, 0, mode_provenance('secret', 'test-id', payload(), 0, 0))):
+                with self.subTest(status=status, provenance=provenance, publish=publish):
+                    with closing(sqlite3.connect(self.db)) as db, db:
+                        db.execute('UPDATE work SET status=?,completed_at=0,publish_eligible=?,notifications_enabled=?,mode_provenance=?', (status, publish, notifications, provenance))
+                        db.execute("UPDATE outbox SET status='sent'")
+                        before = [db.execute('SELECT * FROM ' + table).fetchall() for table in ('queue', 'work', 'webhook_signatures', 'outbox', 'tombstone')]
+                    with patch('receiver.MAX_QUEUE', 1):
+                        self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+                        self.assertEqual(self.send(), 200)
+                        self.assertEqual(self.send(payload(action='reopened')), 409)
+                    with closing(sqlite3.connect(self.db)) as db:
+                        self.assertEqual([db.execute('SELECT * FROM ' + table).fetchall() for table in ('queue', 'work', 'webhook_signatures', 'outbox', 'tombstone')], before)
+
     def test_old_done_result_is_not_evicted_even_after_notifications_sent(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
@@ -122,26 +160,25 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(db.execute('SELECT status FROM work').fetchone(), ('done',))
             self.assertIsNotNone(db.execute('SELECT body FROM queue').fetchone())
 
-    def test_completed_work_cleanup_preserves_replay_and_delivery_conflict(self):
+    def test_completed_work_retention_preserves_replay_and_delivery_conflict(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         from outbox import Outbox
         messages = []
-        box = Outbox(self.db, repos={123: 'acme/repo'})
+        box = Outbox(self.db, repos={123: 'acme/repo'}, webhook_secret='secret')
         for _ in range(3):
             self.assertEqual(box.send_once(messages.append), 'sent')
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
         with patch('receiver.MAX_QUEUE', 1):
-            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'alias'}), 200)
             self.assertEqual(self.send(payload(action='reopened')), 409)
-        from outbox import Outbox
         with closing(sqlite3.connect(self.db)) as db:
-            self.assertIsNone(db.execute("SELECT 1 FROM queue WHERE delivery_id='test-id'").fetchone())
+            self.assertIsNotNone(db.execute("SELECT 1 FROM queue WHERE delivery_id='test-id'").fetchone())
             self.assertEqual(db.execute("SELECT event,repo_id,repo_name,pr_number FROM outbox WHERE delivery_id='test-id' ORDER BY id").fetchall(),
                              [('detected', 123, 'acme/repo', 1), ('started', 123, 'acme/repo', 1), ('failed', 123, 'acme/repo', 1)])
         self.assertTrue(all('acme/repo #1' in message for message in messages))
@@ -203,7 +240,7 @@ class SecurityTest(unittest.TestCase):
                     self.assertEqual(db.execute('SELECT status FROM work').fetchone()[0], status)
                     db.execute('DELETE FROM work'); db.execute('DELETE FROM queue')
 
-    def test_insert_integrity_error_rolls_back_cleanup(self):
+    def test_insert_integrity_error_rolls_back_transaction(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
         worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
@@ -214,7 +251,7 @@ class SecurityTest(unittest.TestCase):
             db.execute("UPDATE outbox SET status='sent'")
             before = db.execute('SELECT * FROM work').fetchall()
             db.execute("CREATE TRIGGER reject_insert BEFORE INSERT ON queue BEGIN SELECT RAISE(ABORT, 'fail'); END")
-        with patch('receiver.MAX_QUEUE', 1):
+        with patch('receiver.MAX_QUEUE', 2):
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
             with closing(sqlite3.connect(self.db)) as db, db:
                 self.assertEqual(db.execute('SELECT delivery_id, body FROM queue').fetchall(), [('test-id', payload())])
@@ -223,7 +260,7 @@ class SecurityTest(unittest.TestCase):
                 db.execute('DROP TRIGGER reject_insert')
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
 
-    def test_cleanup_rollback_and_restart_preserve_replay(self):
+    def test_full_queue_and_restart_preserve_replay(self):
         from worker import Worker
         from receiver import create_server
         self.assertEqual(self.send(), 202)
@@ -240,7 +277,7 @@ class SecurityTest(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT count(*) FROM tombstone').fetchone()[0], 0)
                 self.assertEqual(db.execute('SELECT count(*) FROM work').fetchone()[0], 1)
                 db.execute('DROP TRIGGER reject_cleanup')
-            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 202)
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
             server = create_server('secret', {123: 'acme/repo'}, self.db, port=0)
             server.server_close()
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'alias'}), 200)

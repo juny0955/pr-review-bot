@@ -61,8 +61,8 @@ class MVPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
             db = os.path.join(root, 'queue')
             with closing(sqlite3.connect(db)) as conn, conn:
-                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
-                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, publish_eligible INTEGER)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done', 1)")
             class Stop:
                 def __init__(self): self.polls = 0
                 def is_set(self): return self.polls >= 3
@@ -76,8 +76,8 @@ class MVPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
             db = os.path.join(root, 'queue')
             with closing(sqlite3.connect(db)) as conn, conn:
-                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
-                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, publish_eligible INTEGER)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done', 1)")
             class Stop:
                 def __init__(self): self.now = 0
                 def is_set(self): return self.now >= 40
@@ -95,8 +95,8 @@ class MVPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
             db = os.path.join(root, 'queue')
             with closing(sqlite3.connect(db)) as conn, conn:
-                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
-                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, publish_eligible INTEGER)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done', 1)")
             class Stop:
                 now = 0
                 def is_set(self): return self.now >= 1300
@@ -149,10 +149,11 @@ class MVPTests(unittest.TestCase):
                       'sha': HEAD, 'base_sha': BASE, 'review': review}
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT, body BLOB)')
-                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, result TEXT)')
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT)')
                 conn.execute('CREATE TABLE webhook_signatures (delivery_id TEXT, signature TEXT)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('delivery', body))
-                conn.execute('INSERT INTO work VALUES (?, ?, ?)', ('delivery', 'done', json.dumps(result)))
+                from worker import mode_provenance
+                conn.execute('INSERT INTO work VALUES (?, ?, ?, ?, ?, ?)', ('delivery', 'done', json.dumps(result), 1, 1, mode_provenance('test-secret', 'delivery', body, 1, 1)))
                 conn.execute('INSERT INTO webhook_signatures VALUES (?, ?)', ('delivery', 'sha256=' + hmac.new(b'test-secret', body, hashlib.sha256).hexdigest()))
             github = Mock()
             github.current.return_value = {'repo_id': 123, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE}

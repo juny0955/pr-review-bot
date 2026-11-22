@@ -156,10 +156,32 @@ def wiki_evidence(root, query=''):
             os.close(fd)
 
 
+def mode_provenance(secret, delivery, body, publish, notifications):
+    import hashlib
+    import hmac
+    if (not isinstance(secret, str) or not secret or not isinstance(delivery, str)
+            or not isinstance(body, bytes) or publish not in (0, 1) or notifications not in (0, 1)):
+        return None
+    payload = json.dumps(['mode-v1', delivery, hashlib.sha256(body).hexdigest(), publish, notifications], separators=(',', ':')).encode()
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def valid_mode(secret, delivery, body, publish, notifications, provenance):
+    import hmac
+    expected = mode_provenance(secret, delivery, body, publish, notifications)
+    return bool(expected and isinstance(provenance, str) and re.fullmatch(r'[0-9a-f]{64}', provenance)
+                and hmac.compare_digest(provenance, expected))
+
+
 class Worker:
-    def __init__(self, db_path, github, model, wiki, repos, lease_seconds=300, clock=time.time):
+    def __init__(self, db_path, github, model, wiki, repos, lease_seconds=300, clock=time.time,
+                 *, publish_eligible=False, notifications_enabled=True, webhook_secret=None):
         if lease_seconds <= 0:
             raise ValueError('lease must be positive')
+        if type(publish_eligible) is not bool or type(notifications_enabled) is not bool:
+            raise ValueError('invalid job mode')
+        self.publish_eligible, self.notifications_enabled = publish_eligible, notifications_enabled
+        self.webhook_secret = webhook_secret
         allowed(repos)
         self.repos = repos
         self.db_path, self.github, self.model, self.wiki = db_path, github, model, wiki
@@ -178,6 +200,11 @@ class Worker:
             if 'completed_at' not in columns:
                 db.execute('ALTER TABLE work ADD COLUMN completed_at REAL')
                 db.execute("UPDATE work SET completed_at=? WHERE status IN ('done','skipped','failed')", (self.clock(),))
+            for column in ('publish_eligible', 'notifications_enabled'):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE work ADD COLUMN {column} INTEGER')
+            if 'mode_provenance' not in columns:
+                db.execute('ALTER TABLE work ADD COLUMN mode_provenance TEXT')
             Outbox.install_work_triggers(db)
 
     def claim(self):
@@ -186,25 +213,35 @@ class Worker:
             db.execute('BEGIN IMMEDIATE')
             now = self.clock()
             # A crashed final attempt must also become terminal; do not reclaim it.
+            db.create_function('valid_mode', 5, lambda delivery, body, publish, notifications, mac:
+                               valid_mode(self.webhook_secret, delivery, body, publish, notifications, mac))
             db.execute('''UPDATE work SET status='failed', lease_token=NULL, lease_until=NULL,
-                next_attempt_at=NULL, result=?, completed_at=? WHERE attempts >= 3 AND
+                next_attempt_at=NULL, result=?, completed_at=? WHERE attempts >= 3
+                AND EXISTS (SELECT 1 FROM queue q WHERE q.delivery_id=work.delivery_id AND valid_mode(work.delivery_id,q.body,work.publish_eligible,work.notifications_enabled,work.mode_provenance)) AND
                 (status='retry' OR (status='running' AND lease_until <= ?))''',
                 (json.dumps({'status': 'failed', 'reason': 'processing failed'}), now, now))
+            db.execute("UPDATE outbox SET status='suppressed' WHERE status='pending' AND delivery_id IN (SELECT w.delivery_id FROM work w JOIN queue q ON q.delivery_id=w.delivery_id WHERE w.notifications_enabled=0 AND valid_mode(w.delivery_id,q.body,w.publish_eligible,w.notifications_enabled,w.mode_provenance))")
             db.execute('''UPDATE work SET status='retry', next_attempt_at=lease_until +
                 CASE attempts WHEN 1 THEN 30 ELSE 60 END, lease_token=NULL, lease_until=NULL,
-                result=? WHERE status='running' AND lease_until <= ? AND attempts < 3''',
+                result=? WHERE status='running' AND lease_until <= ? AND attempts < 3
+                AND EXISTS (SELECT 1 FROM queue q WHERE q.delivery_id=work.delivery_id AND valid_mode(work.delivery_id,q.body,work.publish_eligible,work.notifications_enabled,work.mode_provenance))''',
                 (json.dumps({'status': 'retry', 'reason': 'processing failed'}), now))
             row = db.execute('''SELECT q.delivery_id, q.body FROM queue q
                 LEFT JOIN work w ON w.delivery_id=q.delivery_id
-                WHERE w.delivery_id IS NULL OR (w.status='retry' AND COALESCE(w.next_attempt_at, 0) <= ?)
-                ORDER BY q.rowid LIMIT 1''', (now,)).fetchone()
+                WHERE w.delivery_id IS NULL OR (w.status='retry' AND COALESCE(w.next_attempt_at, 0) <= ?
+                    AND w.publish_eligible=? AND w.notifications_enabled=? AND valid_mode(w.delivery_id,q.body,w.publish_eligible,w.notifications_enabled,w.mode_provenance))
+                ORDER BY q.rowid LIMIT 1''', (now, int(self.publish_eligible), int(self.notifications_enabled))).fetchone()
             if row is None:
                 return None
-            db.execute('''INSERT INTO work(delivery_id,status,lease_token,lease_until,attempts)
-                VALUES (?,'running',?,?,1)
+            provenance = mode_provenance(self.webhook_secret, row[0], row[1], int(self.publish_eligible), int(self.notifications_enabled))
+            db.execute('''INSERT INTO work(delivery_id,status,lease_token,lease_until,attempts,publish_eligible,notifications_enabled,mode_provenance)
+                VALUES (?,'running',?,?,1,?,?,?)
                 ON CONFLICT(delivery_id) DO UPDATE SET status='running',
                 lease_token=excluded.lease_token, lease_until=excluded.lease_until,
-                attempts=work.attempts+1, result=NULL''', (row[0], token, now + self.lease_seconds))
+                attempts=work.attempts+1, result=NULL''', (row[0], token, now + self.lease_seconds,
+                    int(self.publish_eligible), int(self.notifications_enabled), provenance))
+            if not self.notifications_enabled:
+                db.execute("UPDATE outbox SET status='suppressed' WHERE delivery_id=? AND status='pending'", (row[0],))
         return row[0], row[1], token
 
     def finish(self, delivery, token, status, result):
@@ -226,6 +263,8 @@ class Worker:
                 next_attempt_at=?, completed_at=? WHERE delivery_id=?''',
                 (status, json.dumps(result, ensure_ascii=True), next_attempt,
                  now if status in ('done', 'skipped', 'failed') else None, delivery))
+            if not self.notifications_enabled:
+                db.execute("UPDATE outbox SET status='suppressed' WHERE delivery_id=? AND status='pending'", (delivery,))
             return True
 
     def run_once(self):

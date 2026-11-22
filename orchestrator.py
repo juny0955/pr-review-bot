@@ -51,7 +51,7 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
     while not stop.is_set():
         try:
             with closing(sqlite3.connect(db, timeout=5)) as conn:
-                ids = [row[0] for row in conn.execute("SELECT delivery_id FROM work WHERE status='done'")]
+                ids = [row[0] for row in conn.execute("SELECT delivery_id FROM work WHERE status='done' AND publish_eligible=1")]
             poll_error = False
             errors.intersection_update(ids)
             ambiguous.intersection_update(ids)
@@ -175,7 +175,10 @@ def main(argv=None):
             publish_auth = InstallationAuth(read_auth.app_id, read_auth.installation_id, read_auth.key_path,
                                             args.repos, 'publish', installation_transport)
         model = resolve_hermes_direct_adapter()
-        worker = Worker(str(db), github, model, args.wiki, args.repos)
+        worker = Worker(str(db), github, model, args.wiki, args.repos,
+                        publish_eligible=args.single_vps_publish,
+                        notifications_enabled=args.enable_discord_notifications,
+                        webhook_secret=os.environ.get('WEBHOOK_SECRET'))
         stop = threading.Event()
         previous = {}
         def request_stop(signum, frame):
@@ -187,7 +190,7 @@ def main(argv=None):
             try:
                 if notifier is not None:
                     thread = threading.Thread(target=notification_loop,
-                                              args=(Outbox(str(db), repos=args.repos), notifier, channel, stop))
+                                              args=(Outbox(str(db), repos=args.repos, webhook_secret=os.environ.get('WEBHOOK_SECRET')), notifier, channel, stop))
                     thread.start()
                     started.append(thread)
                 if args.single_vps_publish:

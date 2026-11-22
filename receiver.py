@@ -1,12 +1,10 @@
 """Local-only GitHub pull request webhook intake; no outbound operations.
 
-At capacity, terminal skipped or failed work at least seven days old is replaced transactionally with permanent SHA-256
-tombstones. Done results are retained indefinitely because publication uses a separate ledger.
-This bounds queue rows, not tombstone or SQLite disk usage; backups
-and disk monitoring are operator responsibilities. A restored or deleted database loses replay history since its backup.
+Queue entries are never automatically evicted; saturation returns 503.
+Offline retention may replace eligible results with permanent SHA-256 tombstones.
+Backups and disk monitoring are operator responsibilities. A restored or deleted database loses replay history since its backup.
 The signature authenticates the body, not the delivery ID; tombstones cannot
 prevent replay after database loss or protect against a compromised secret.
-Pending, retrying, and leased work is never evicted; saturation returns 503.
 """
 from contextlib import closing
 import hashlib
@@ -125,23 +123,8 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                     if db.execute('SELECT 1 FROM tombstone WHERE body_hash=? LIMIT 1', (digest,)).fetchone():
                         return self.reply(200, 'duplicate')
                     if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
-                        # ponytail: evict one expired terminal result only when full;
-                        # tombstones grow indefinitely to preserve replay defense.
-                        if 'completed_at' in {r[1] for r in db.execute('PRAGMA table_info(work)')}:
-                            row = db.execute("""SELECT q.delivery_id, q.body FROM queue q JOIN work w
-                                ON w.delivery_id=q.delivery_id WHERE w.status IN ('skipped','failed')
-                                AND w.completed_at <= CAST(strftime('%s','now') AS INTEGER) - 7 * 86400
-                                AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.delivery_id=q.delivery_id
-                                    AND o.status IS NOT 'sent')
-                                ORDER BY w.completed_at, q.rowid LIMIT 1""").fetchone()
-                            if row:
-                                db.execute('INSERT INTO tombstone(delivery_id, body_hash) VALUES (?, ?)',
-                                           (row[0], hashlib.sha256(row[1]).digest()))
-                                db.execute('DELETE FROM work WHERE delivery_id=?', (row[0],))
-                                db.execute('DELETE FROM webhook_signatures WHERE delivery_id=?', (row[0],))
-                                db.execute('DELETE FROM queue WHERE delivery_id=?', (row[0],))
-                        if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
-                            raise sqlite3.OperationalError('queue full')
+                        # ponytail: retain every row; only offline retention may delete.
+                        raise sqlite3.OperationalError('queue full')
                     db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
                     db.execute('INSERT INTO webhook_signatures VALUES (?, ?)', (delivery, signature))
                     db.execute("UPDATE outbox SET repo_id=?,repo_name=?,pr_number=? WHERE delivery_id=? AND event='detected'", (repo_id, repo, number, delivery))
