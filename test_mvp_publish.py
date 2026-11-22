@@ -18,7 +18,7 @@ def revoke_auto(path, started, done):
     started.set()
     with patch('revocation_gate._trusted_directory', side_effect=lambda p: os.open(p, os.O_RDONLY | os.O_DIRECTORY)):
         _, version = gate_snapshot(path)
-        update_gate(path, {'123': REPO}, [], auto_repos={}, expected=version)
+        update_gate(path, {'1466550689': REPO}, [], auto_repos={}, expected=version)
     done.set()
 
 REPO = 'juny0955/pr-review-bot'
@@ -27,12 +27,33 @@ HEAD, BASE = 'a' * 40, 'b' * 40
 
 class MVPTests(unittest.TestCase):
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+    def test_auto_policy_exact_pairs_and_explicit_gate(self, _trusted):
+        pairs = {'1466550689': REPO, '1447840098': 'juny0955/rfsync'}
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as gate:
+            open(os.path.join(gate, 'lock'), 'w').close()
+            os.chmod(os.path.join(gate, 'lock'), 0o600)
+            update_gate(gate, pairs, [], auto_repos=pairs)
+            for key, name in pairs.items():
+                identity = [int(key), name, 7, HEAD, BASE, 'c' * 64]
+                with authorize(gate, identity, single_vps_mvp=True): pass
+                with self.assertRaises(ValueError):
+                    with authorize(gate, identity): pass
+            for key, name in [('1466550689', 'juny0955/rfsync'),
+                              ('1447840098', REPO), ('123', REPO),
+                              ('1447840098', 'other/repo')]:
+                with self.subTest(key=key, name=name), self.assertRaises(ValueError):
+                    update_gate(gate, {key: name}, [], auto_repos={key: name}, expected=gate_snapshot(gate)[1])
+            update_gate(gate, pairs, [], auto_repos={'1466550689': REPO}, expected=gate_snapshot(gate)[1])
+            with self.assertRaises(ValueError):
+                with authorize(gate, [1447840098, pairs['1447840098'], 7, HEAD, BASE, 'c' * 64], single_vps_mvp=True): pass
+
+    @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
     def test_auto_policy_revocation_and_scope(self, _trusted):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as gate:
             open(os.path.join(gate, 'lock'), 'w').close()
             os.chmod(os.path.join(gate, 'lock'), 0o600)
-            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
-            identity = [123, REPO, 7, HEAD, BASE, 'c' * 64]
+            update_gate(gate, {'1466550689': REPO}, [], auto_repos={'1466550689': REPO})
+            identity = [1466550689, REPO, 7, HEAD, BASE, 'c' * 64]
             with self.assertRaises(ValueError):
                 with authorize(gate, identity): pass
             with authorize(gate, identity, single_vps_mvp=True): pass
@@ -51,7 +72,7 @@ class MVPTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     with authorize(gate, identity, single_vps_mvp=True): pass
                 with self.assertRaises(ValueError):
-                    update_gate(gate, {'123': REPO}, [], auto_repos={'123': 'other/repo'}, expected=gate_snapshot(gate)[1])
+                    update_gate(gate, {'1466550689': REPO}, [], auto_repos={'1466550689': 'other/repo'}, expected=gate_snapshot(gate)[1])
             finally:
                 if proc.pid is not None:
                     if proc.is_alive(): proc.terminate()
@@ -117,18 +138,18 @@ class MVPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as gate:
             open(os.path.join(gate, 'lock'), 'w').close()
             os.chmod(os.path.join(gate, 'lock'), 0o600)
-            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
+            update_gate(gate, {'1466550689': REPO}, [], auto_repos={'1466550689': REPO})
             post = Mock(side_effect=TimeoutError())
-            current = Mock(return_value={'repo_id': 123, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE})
-            pub = GitHubPublisher(post, current, {123: REPO}, enabled=True, single_vps_mvp=True,
+            current = Mock(return_value={'repo_id': 1466550689, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE})
+            pub = GitHubPublisher(post, current, {1466550689: REPO}, enabled=True, single_vps_mvp=True,
                                   gate_path=gate, ledger_path=os.path.join(gate, 'ledger'), get=lambda _: [])
             with self.assertRaises(ValueError):
-                pub.publish(123, REPO, 7, HEAD, 'password=supersecret', base_sha=BASE)
+                pub.publish(1466550689, REPO, 7, HEAD, 'password=supersecret', base_sha=BASE)
             current.return_value['base_sha'] = 'c' * 40
-            with self.assertRaises(ValueError): pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE)
+            with self.assertRaises(ValueError): pub.publish(1466550689, REPO, 7, HEAD, 'review', base_sha=BASE)
             current.return_value['base_sha'] = BASE
-            self.assertEqual(pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
-            self.assertEqual(pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
+            self.assertEqual(pub.publish(1466550689, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
+            self.assertEqual(pub.publish(1466550689, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
             post.assert_called_once()
 
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
@@ -139,13 +160,13 @@ class MVPTests(unittest.TestCase):
             open(os.path.join(gate, 'lock'), 'w').close()
             os.chmod(os.path.join(gate, 'lock'), 0o600)
             review = 'Check the boundary condition.'
-            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
+            update_gate(gate, {'1466550689': REPO}, [], auto_repos={'1466550689': REPO})
             db = os.path.join(root, 'queue')
             ledger = os.path.join(root, 'ledger')
-            event = {'repository': {'id': 123, 'full_name': REPO}, 'number': 7,
+            event = {'repository': {'id': 1466550689, 'full_name': REPO}, 'number': 7,
                      'pull_request': {'number': 7, 'head': {'sha': HEAD}, 'state': 'open', 'draft': False}, 'action': 'opened'}
             body = json.dumps(event).encode()
-            result = {'status': 'done', 'repo_id': 123, 'repository': REPO, 'number': 7,
+            result = {'status': 'done', 'repo_id': 1466550689, 'repository': REPO, 'number': 7,
                       'sha': HEAD, 'base_sha': BASE, 'review': review}
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT, body BLOB)')
@@ -156,7 +177,7 @@ class MVPTests(unittest.TestCase):
                 conn.execute('INSERT INTO work VALUES (?, ?, ?, ?, ?, ?, ?)', ('delivery', 'done', json.dumps(result), 1, 1, mode_provenance('test-secret', 'delivery', body, 1, 1), result_provenance('test-secret', 'delivery', body, 1, 1, json.dumps(result))))
                 conn.execute('INSERT INTO webhook_signatures VALUES (?, ?)', ('delivery', 'sha256=' + hmac.new(b'test-secret', body, hashlib.sha256).hexdigest()))
             github = Mock()
-            github.current.return_value = {'repo_id': 123, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE}
+            github.current.return_value = {'repo_id': 1466550689, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE}
             auth = Mock()
             auth.token.return_value = ('synthetic-token', 999)
             class Once:
@@ -165,7 +186,7 @@ class MVPTests(unittest.TestCase):
                 def wait(self, _): self.stopped = True
             with patch('orchestrator.publish_transport') as post, patch('orchestrator.review_list_transport', return_value=[]):
                 for _ in range(2):
-                    publication_loop(db, {123: REPO}, github, auth, ledger, gate, 'test-secret', Once())
+                    publication_loop(db, {1466550689: REPO}, github, auth, ledger, gate, 'test-secret', Once())
                 self.assertEqual(post.call_count, 1)
                 self.assertEqual(post.call_args.args[1], '/repos/' + REPO + '/pulls/7/reviews')
             class ThreePolls:
@@ -182,7 +203,7 @@ class MVPTests(unittest.TestCase):
             with patch('orchestrator.time.monotonic', side_effect=lambda: stop.count * 5), \
                  patch('orchestrator.publish_transport', side_effect=timeout_after_post) as post, \
                  patch('orchestrator.review_list_transport', side_effect=list_reviews) as get:
-                publication_loop(db, {123: REPO}, github, auth, os.path.join(root, 'ledger2'), gate, 'test-secret', stop)
+                publication_loop(db, {1466550689: REPO}, github, auth, os.path.join(root, 'ledger2'), gate, 'test-secret', stop)
                 self.assertEqual(post.call_count, 1)
                 self.assertEqual(get.call_count, 1)
                 with closing(sqlite3.connect(os.path.join(root, 'ledger2'))) as conn:
@@ -190,7 +211,7 @@ class MVPTests(unittest.TestCase):
             with patch('orchestrator.publish_transport') as post:
                 with closing(sqlite3.connect(db)) as conn, conn:
                     conn.execute('UPDATE webhook_signatures SET signature=?', ('sha256=' + '0' * 64,))
-                publication_loop(db, {123: REPO}, github, auth, ledger, gate, 'test-secret', Once())
+                publication_loop(db, {1466550689: REPO}, github, auth, ledger, gate, 'test-secret', Once())
                 self.assertEqual(post.call_count, 0)
 
 

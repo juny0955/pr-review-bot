@@ -16,7 +16,7 @@ from worker import ACTIONS, mode_provenance, valid_result
 
 def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=None,
                           ledger_path=None, enabled=False, approve=None, gate_path=None,
-                          single_vps_mvp=False, webhook_secret=None):
+                          single_vps_mvp=False, webhook_secret=None, diff=None):
     if type(enabled) is not bool:
         raise ValueError('enabled must be boolean')
     with closing(sqlite3.connect(db_path, timeout=5)) as db:
@@ -61,7 +61,7 @@ def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=Non
         raise ValueError('invalid worker result or event') from exc
     publisher = GitHubPublisher(post, current, repos, enabled=enabled,
                                 ledger_path=ledger_path, get=get, gate_path=gate_path,
-                                single_vps_mvp=single_vps_mvp)
+                                single_vps_mvp=single_vps_mvp, diff=diff)
     if enabled and (not callable(approve) or approve(repo_id, repo, number, sha, base, review) is not True):
         raise ValueError('public release not approved')
     return publisher.publish(repo_id, repo, number, sha, review, base_sha=base)

@@ -81,7 +81,8 @@ def _read_state(directory, name='state.json'):
     auto = state.get('auto_repos', {})
     if (not isinstance(auto, dict) or any(
             key not in state['policy'] or state['policy'][key] != value
-            or value != 'juny0955/pr-review-bot' for key, value in auto.items())):
+            or {'1466550689': 'juny0955/pr-review-bot',
+                '1447840098': 'juny0955/rfsync'}.get(key) != value for key, value in auto.items())):
         raise ValueError('invalid automatic publication policy')
     for entry in state['approvals']:
         if (not isinstance(entry, list) or len(entry) != 6

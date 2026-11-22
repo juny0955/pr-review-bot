@@ -15,8 +15,8 @@ from retention import cleanup_done
 from orchestrator import publication_loop
 
 R, H, B = 'juny0955/pr-review-bot', 'a'*40, 'b'*40
-EVENT = {'action':'opened','repository':{'id':123,'full_name':R},'number':7,'pull_request':{'number':7,'head':{'sha':H},'base':{'sha':B},'state':'open','draft':False}}
-RESULT = {'status':'done','repo_id':123,'repository':R,'number':7,'sha':H,'base_sha':B,'review':'synthetic'}
+EVENT = {'action':'opened','repository':{'id':1466550689,'full_name':R},'number':7,'pull_request':{'number':7,'head':{'sha':H},'base':{'sha':B},'state':'open','draft':False}}
+RESULT = {'status':'done','repo_id':1466550689,'repository':R,'number':7,'sha':H,'base_sha':B,'review':'synthetic'}
 
 class ModeSecurity(unittest.TestCase):
     def test_provenance_binds_each_input(self):
@@ -43,7 +43,7 @@ class ModeSecurity(unittest.TestCase):
             c.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('d','sha256='+hmac.new(b'fake',self.body,hashlib.sha256).hexdigest()))
 
     def worker(self, live=False, notifications=False, now=100):
-        return Worker(self.db, Mock(), Mock(), self.tmp.name, {123:R}, clock=lambda:now, lease_seconds=1, publish_eligible=live, notifications_enabled=notifications, webhook_secret='fake')
+        return Worker(self.db, Mock(), Mock(), self.tmp.name, {1466550689:R}, clock=lambda:now, lease_seconds=1, publish_eligible=live, notifications_enabled=notifications, webhook_secret='fake')
 
     def test_retry_and_outbox_require_valid_mode_provenance(self):
         for live, notifications in ((1, 1), (0, 1)):
@@ -59,7 +59,7 @@ class ModeSecurity(unittest.TestCase):
                     w.model.review.assert_not_called()
                     wiki.assert_not_called()
                     send = Mock()
-                    box = Outbox(self.db, clock=lambda:100, repos={123:R}, webhook_secret='fake')
+                    box = Outbox(self.db, clock=lambda:100, repos={1466550689:R}, webhook_secret='fake')
                     self.assertIsNone(box.send_once(send))
                     send.assert_not_called()
                     with closing(sqlite3.connect(self.db)) as c:
@@ -77,11 +77,11 @@ class ModeSecurity(unittest.TestCase):
     def test_outbox_checks_mode_and_source_before_send(self):
         w = self.worker(notifications=True)
         w.claim()
-        box = Outbox(self.db, clock=lambda:100, repos={123:R}, webhook_secret='fake')
+        box = Outbox(self.db, clock=lambda:100, repos={1466550689:R}, webhook_secret='fake')
         send = Mock()
         with closing(sqlite3.connect(self.db)) as c, c:
             original = c.execute('SELECT mode_provenance FROM work').fetchone()[0]
-            c.execute("UPDATE outbox SET repo_id=123,repo_name=?,pr_number=7", (R,))
+            c.execute("UPDATE outbox SET repo_id=1466550689,repo_name=?,pr_number=7", (R,))
         for value in (None, '0' * 64, 'é' * 64):
             with closing(sqlite3.connect(self.db)) as c, c:
                 c.execute('UPDATE work SET mode_provenance=?', (value,))
@@ -97,7 +97,7 @@ class ModeSecurity(unittest.TestCase):
         send.assert_called_once()
 
     def publish(self, secret='fake', mvp=True):
-        return publish_worker_result(self.db, 'd', post=self.post, current=Mock(return_value={'repo_id':123,'repo':R,'state':'open','draft':False,'sha':H,'base_sha':B}), repos={123:R}, get=lambda _:[], ledger_path=self.ledger, enabled=True, approve=lambda *a:True, gate_path='fake', single_vps_mvp=mvp, webhook_secret=secret)
+        return publish_worker_result(self.db, 'd', post=self.post, current=Mock(return_value={'repo_id':1466550689,'repo':R,'state':'open','draft':False,'sha':H,'base_sha':B}), repos={1466550689:R}, get=lambda _:[], ledger_path=self.ledger, enabled=True, approve=lambda *a:True, gate_path='fake', single_vps_mvp=mvp, webhook_secret=secret)
 
     def test_provenance_and_direct_paths(self):
         self.post = Mock()
@@ -137,7 +137,7 @@ class ModeSecurity(unittest.TestCase):
             original, mac = c.execute('SELECT result,result_provenance FROM work').fetchone()
             c.execute('UPDATE work SET completed_at=0')
             c.execute("UPDATE outbox SET status='suppressed'")
-        key = hashlib.sha256(json.dumps(['v2', 123, R, 7, H, B, 'synthetic'], ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps(['v2', 1466550689, R, 7, H, B, 'synthetic'], ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
         with closing(sqlite3.connect(self.ledger)) as c, c:
             c.execute('CREATE TABLE publications(key TEXT PRIMARY KEY,marker TEXT,state TEXT)')
             c.execute('INSERT INTO publications VALUES (?,?,?)', (key, 'marker', 'sent'))
@@ -162,15 +162,15 @@ class ModeSecurity(unittest.TestCase):
         stop = Mock()
         stop.is_set.side_effect = [False, False, True]
         github, auth = Mock(), Mock()
-        github.current.return_value = {'repo_id':123,'repo':R,'state':'open','draft':False,'sha':H,'base_sha':B}
+        github.current.return_value = {'repo_id':1466550689,'repo':R,'state':'open','draft':False,'sha':H,'base_sha':B}
         auth.token.return_value = ('fake', 999)
         with patch('publisher._require_revocation_gate', return_value=nullcontext()), patch('orchestrator.publish_transport') as post:
-            publication_loop(self.db, {123:R}, github, auth, self.ledger, 'fake', 'fake', stop)
+            publication_loop(self.db, {1466550689:R}, github, auth, self.ledger, 'fake', 'fake', stop)
             post.assert_not_called()
 
     def test_before_claim_and_expired_suppressed(self):
         w = self.worker()
-        box = Outbox(self.db, clock=lambda:1000, repos={123:R})
+        box = Outbox(self.db, clock=lambda:1000, repos={1466550689:R})
         sent = Mock()
         self.assertIsNone(box.send_once(sent))
         w.claim()
@@ -186,7 +186,7 @@ class ModeSecurity(unittest.TestCase):
         _,_,token=w.claim()
         w.finish('d',token,'done',RESULT)
         with closing(sqlite3.connect(self.db)) as c, c: c.execute('UPDATE work SET completed_at=0')
-        key = hashlib.sha256(json.dumps([123,R,7,H,'synthetic'],ensure_ascii=True,separators=(',',':')).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps([1466550689,R,7,H,'synthetic'],ensure_ascii=True,separators=(',',':')).encode()).hexdigest()
         with closing(sqlite3.connect(self.ledger)) as c, c:
             c.execute('CREATE TABLE publications(key TEXT PRIMARY KEY,marker TEXT,state TEXT)')
             c.execute('INSERT INTO publications VALUES (?,?,?)',(key,'old','ambiguous'))

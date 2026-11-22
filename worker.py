@@ -359,6 +359,10 @@ class Worker:
         review = self.model.review(request)
         if not isinstance(review, str) or not review.strip() or len(review.encode('utf-8')) > MAX_REVIEW:
             raise ValueError('invalid review')
+        from inline_review import prepare_review
+        review = prepare_review(review, diff)
+        if len(review.encode('utf-8')) > MAX_REVIEW:
+            raise ValueError('invalid review')
         if eligible(base_sha) is None:
             return {'status': 'skipped', 'reason': 'stale or ineligible PR'}
         return {'status': 'done', 'repo_id': repo_id, 'repository': repo, 'number': number, 'sha': sha,

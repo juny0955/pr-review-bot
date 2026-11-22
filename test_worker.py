@@ -124,6 +124,44 @@ class WorkerTest(unittest.TestCase):
                 self.enqueue(delivery=str(index))
                 self.assertEqual(self.worker.run_once()['status'], 'retry')
 
+    def test_invalid_json_retries_without_persisting_review_then_succeeds(self):
+        now = [100]
+        self.worker.clock = lambda: now[0]
+        responses = iter(['{"body":"synthetic finding', '{"body":"ok","comments":[]}'])
+        self.model.review = lambda request: next(responses)
+        self.enqueue()
+        self.assertEqual(self.worker.run_once()['status'], 'retry')
+        with closing(sqlite3.connect(self.db)) as db:
+            status, result = db.execute('SELECT status,result FROM work').fetchone()
+            self.assertEqual(status, 'retry')
+            self.assertNotIn('synthetic finding', result)
+        now[0] += 30
+        self.assertEqual(self.worker.run_once()['status'], 'done')
+
+    def test_embedded_incomplete_structured_reviews_retry_without_persisting(self):
+        responses = [
+            'Here is the review:\n{"body":"synthetic incomplete finding',
+            'Here is the review:\n```json\n{"body":"synthetic incomplete finding',
+            'Here is the review:\n```\n{"comments":[{"body":"synthetic incomplete finding',
+            'Here is the review: pr-review-inline-v1:{"body":"synthetic incomplete finding',
+            'Here is the review: "comments": [ synthetic incomplete finding',
+        ]
+        for index, review in enumerate(responses):
+            with self.subTest(review=review):
+                self.model.review = lambda request: review
+                self.enqueue(delivery=str(index))
+                self.assertEqual(self.worker.run_once()['status'], 'retry')
+                with closing(sqlite3.connect(self.db)) as db:
+                    status, result = db.execute('SELECT status,result FROM work WHERE delivery_id=?', (str(index),)).fetchone()
+                    self.assertEqual(status, 'retry')
+                    self.assertNotIn('synthetic incomplete finding', result)
+
+    def test_plain_text_review_with_code_fence_remains_compatible(self):
+        review = '기존 리뷰\n```python\nprint("hello")\n```'
+        self.model.review = lambda request: review
+        self.enqueue()
+        self.assertEqual(self.worker.run_once()['review'], review)
+
     def test_review_is_durable_and_not_repeated(self):
         self.enqueue()
         result = self.worker.run_once()

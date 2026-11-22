@@ -16,6 +16,7 @@ from outbox import Outbox
 from repo_config import allowed
 from worker import Worker
 from publish_worker import publish_worker_result
+from publisher import MVP_REPOS
 from github_app_auth import InstallationAuth
 from github_app_transport import installation_transport, publish_transport, review_list_transport
 
@@ -76,7 +77,7 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
                 try:
                     result = publish_worker_result(db, delivery, post=post, current=github.current,
                         repos=repos, get=get, ledger_path=ledger, gate_path=gate, enabled=True,
-                        approve=lambda *args: True, single_vps_mvp=True, webhook_secret=secret)
+                        approve=lambda *args: True, single_vps_mvp=True, webhook_secret=secret, diff=github.diff)
                     errors.discard(delivery)
                     if result == 'sent':
                         finished.add(delivery)
@@ -159,8 +160,8 @@ def main(argv=None):
         db = Path(args.db)
         if db.is_symlink() or not db.is_file():
             raise ValueError('existing queue database required')
-        allowed(args.repos)
-        if args.single_vps_publish and set(allowed(args.repos).values()) != {'juny0955/pr-review-bot'}:
+        repos = allowed(args.repos)
+        if args.single_vps_publish and (not repos or any(MVP_REPOS.get(i) != name for i, name in repos.items())):
             raise ValueError('experimental repository only')
         notifier = channel = None
         if args.enable_discord_notifications:

@@ -60,7 +60,7 @@ class RegressionTests(unittest.TestCase):
                 def join(self): self.joined = True
             github = Mock(auth=Mock(app_id=1, installation_id=2, key_path='fake'))
             with patch.dict(os.environ, {'WEBHOOK_SECRET': 'fake', 'DISCORD_CHANNEL_ID': '123'}, clear=True), \
-                 patch.object(o, 'require_app_read_flag'), patch.object(o, 'allowed', return_value={123: 'juny0955/pr-review-bot'}), \
+                 patch.object(o, 'require_app_read_flag'), patch.object(o, 'allowed', return_value={1466550689: 'juny0955/pr-review-bot'}), \
                  patch.object(o, 'DiscordTransport'), patch.object(o, 'DiscordNotifier'), \
                  patch.object(o, 'GitHubReadOnly', return_value=github), patch.object(o, 'app_read_auth'), \
                  patch.object(o, 'InstallationAuth'), patch.object(o, 'resolve_hermes_direct_adapter'), \
