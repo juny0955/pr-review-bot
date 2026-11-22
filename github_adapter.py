@@ -13,6 +13,7 @@ from contextlib import ExitStack
 
 from worker import MAX_DIFF, SHA
 from repo_config import allowed
+from github_app_transport import read_transport
 
 MAX_METADATA = 256 * 1024
 TIMEOUT = 30
@@ -161,13 +162,21 @@ def _endpoint(repo, number, repos):
 
 
 class GitHubReadOnly:
-    def __init__(self, repos):
+    def __init__(self, repos, *, auth=None):
         allowed(repos)
+        if auth is not None and getattr(auth, 'permission', None) != 'read':
+            raise ValueError('read authentication required')
         self.repos = repos
+        self.auth = auth
 
     def current(self, repo, number):
         endpoint = _endpoint(repo, number, self.repos)
-        obj = json.loads(_gh_get(endpoint, 'application/vnd.github+json', MAX_METADATA))
+        if self.auth is None:
+            obj = json.loads(_gh_get(endpoint, 'application/vnd.github+json', MAX_METADATA))
+        else:
+            repo_id = next(ident for ident, name in allowed(self.repos).items() if name == repo)
+            token, _ = self.auth.token(repo_id, repo)
+            obj = read_transport(token, '/' + endpoint)
         repo_id = obj['base']['repo']['id']
         repo_name = obj['base']['repo']['full_name']
         if type(repo_id) is not int or repo_name != repo or allowed(self.repos).get(repo_id) != repo:
@@ -183,6 +192,9 @@ class GitHubReadOnly:
 
     def diff(self, repo, number, sha, base_sha):
         endpoint = _endpoint(repo, number, self.repos)
+        if self.auth is not None:
+            # ponytail: fail closed until git fetch has isolated read-only credentials.
+            raise RuntimeError('App-authenticated diff unavailable')
         if (not isinstance(sha, str) or not SHA.fullmatch(sha)
                 or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
             raise ValueError('invalid SHA')

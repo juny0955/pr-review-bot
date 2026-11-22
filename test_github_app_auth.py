@@ -98,6 +98,39 @@ class AuthTests(unittest.TestCase):
         self.assertIsNone(err.exception.__cause__)
         self.assertNotIn('test-secret-token', str(err.exception))
 
+    def test_policy_is_reloaded_before_issuance(self):
+        policy = Path(self.tmp.name, 'repos.json')
+        def write_policy(enabled):
+            policy.write_text(json.dumps({'repositories': [
+                {'id': 12, 'full_name': 'owner/repo', 'enabled': enabled}]}))
+        write_policy(True)
+        auth = InstallationAuth(123, 456, self.key, policy, 'read', self.api, clock=lambda: self.now)
+        write_policy(False)
+        with self.assertRaises(ValueError):
+            auth.token(12, 'owner/repo')
+        self.api.assert_not_called()
+        write_policy(True)
+        def clock():
+            write_policy(False)
+            return self.now
+        auth.clock = clock
+        with self.assertRaisesRegex(RuntimeError, '^authentication failed$'):
+            auth.token(12, 'owner/repo')
+        self.api.assert_not_called()
+        write_policy(True)
+        policy.write_text('{')
+        with self.assertRaises(ValueError):
+            auth.token(12, 'owner/repo')
+        self.api.assert_not_called()
+
+    def test_mutable_policy_is_not_snapshotted(self):
+        repos = {12: 'owner/repo'}
+        auth = InstallationAuth(123, 456, self.key, repos, 'read', self.api, clock=lambda: self.now)
+        repos.clear()
+        with self.assertRaises(ValueError):
+            auth.token(12, 'owner/repo')
+        self.api.assert_not_called()
+
     def test_rejects_expired_or_overprivileged_response(self):
         for change in ({'expires_at': '2023-11-14T22:13:20Z'},
                        {'permissions': {'pull_requests': 'write'}},

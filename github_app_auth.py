@@ -26,12 +26,13 @@ class InstallationAuth:
                 or purpose not in ('read', 'publish') or not callable(transport) or not callable(clock)):
             raise ValueError('invalid authentication configuration')
         self.app_id, self.installation_id = app_id, installation_id
-        self.key_path, self.repos = os.fspath(key_path), allowed(repos)
+        allowed(repos)
+        self.key_path, self.repos = os.fspath(key_path), repos
         self.permission = 'read' if purpose == 'read' else 'write'
         self.transport, self.clock = transport, clock
 
     def token(self, repo_id, repo):
-        if type(repo_id) is not int or self.repos.get(repo_id) != repo or not isinstance(repo, str):
+        if type(repo_id) is not int or not isinstance(repo, str) or allowed(self.repos).get(repo_id) != repo:
             raise ValueError('repository not allowed')
         # Do not chain provider, subprocess, filesystem or parsing exceptions: they can contain secrets.
         try:
@@ -80,6 +81,8 @@ class InstallationAuth:
                 or not now - 60 <= current < now + 540):
             raise ValueError('expired JWT or invalid clock')
         permissions = {'pull_requests': self.permission}
+        if allowed(self.repos).get(repo_id) != repo:
+            raise ValueError('repository not allowed')
         response = self.transport(jwt, self.installation_id,
                                   {'repository_ids': [repo_id], 'permissions': permissions.copy()})
         if not isinstance(response, dict):
