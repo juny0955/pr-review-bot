@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import threading
+import time
 import sqlite3
 from contextlib import closing
 
@@ -45,6 +46,7 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
     finished = set()
     ambiguous = set()  # ponytail: log once per unresolved job; restart resets suppression.
     errors = set()  # ponytail: one error per job until recovery; restart resets suppression.
+    retries = {}  # ponytail: in-memory backoff resets on restart; persist only if needed.
     poll_error = False
     while not stop.is_set():
         try:
@@ -54,8 +56,12 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
             errors.intersection_update(ids)
             ambiguous.intersection_update(ids)
             finished.intersection_update(ids)
+            retries = {key: value for key, value in retries.items() if key in ids}
             for delivery in ids:
                 if delivery in finished or stop.is_set():
+                    continue
+                now = time.monotonic()
+                if delivery in retries and now < retries[delivery][0]:
                     continue
                 def token_for_path(path):
                     repo = '/'.join(path.split('/')[2:4])
@@ -78,9 +84,16 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
                         _status('publication_' + result)
                     if result == 'ambiguous':
                         ambiguous.add(delivery)
+                        delay = retries.get(delivery, (0, poll_interval / 2))[1]
+                        delay = min(300, max(poll_interval, delay * 2))
+                        retries[delivery] = (time.monotonic() + delay, delay)
                     else:
                         ambiguous.discard(delivery)
+                        retries.pop(delivery, None)
                 except Exception:
+                    if delivery in ambiguous:
+                        delay = min(300, retries[delivery][1] * 2)
+                        retries[delivery] = (time.monotonic() + delay, delay)
                     if delivery not in errors:
                         _status('publication_error')
                         errors.add(delivery)

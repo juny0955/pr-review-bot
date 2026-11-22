@@ -67,9 +67,49 @@ class MVPTests(unittest.TestCase):
                 def __init__(self): self.polls = 0
                 def is_set(self): return self.polls >= 3
                 def wait(self, _): self.polls += 1
-            with patch('orchestrator.publish_worker_result', side_effect=['ambiguous', 'sent']) as publish:
-                publication_loop(db, {}, Mock(), Mock(), '', '', '', Stop())
+            stop = Stop()
+            with patch('orchestrator.time.monotonic', side_effect=lambda: stop.polls * 5), patch('orchestrator.publish_worker_result', side_effect=['ambiguous', 'sent']) as publish:
+                publication_loop(db, {}, Mock(), Mock(), '', '', '', stop)
             self.assertEqual(publish.call_count, 2)
+
+    def test_ambiguous_retry_backoff(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
+            db = os.path.join(root, 'queue')
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+            class Stop:
+                def __init__(self): self.now = 0
+                def is_set(self): return self.now >= 40
+                def wait(self, interval): self.now += interval
+            stop = Stop()
+            attempts = []
+            def publish(*args, **kwargs):
+                attempts.append(stop.now)
+                return 'ambiguous'
+            with patch('orchestrator.time.monotonic', side_effect=lambda: stop.now), patch('orchestrator.publish_worker_result', side_effect=publish):
+                publication_loop(db, {}, Mock(), Mock(), '', '', '', stop)
+            self.assertEqual(attempts, [0, 5, 15, 35])
+
+    def test_ambiguous_exceptions_back_off_and_recover(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
+            db = os.path.join(root, 'queue')
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+            class Stop:
+                now = 0
+                def is_set(self): return self.now >= 1300
+                def wait(self, interval): self.now += interval
+            stop, attempts = Stop(), []
+            def publish(*args, **kwargs):
+                attempts.append(stop.now)
+                if len(attempts) == 1: return 'ambiguous'
+                if len(attempts) == 10: return 'sent'
+                raise ValueError('synthetic')
+            with patch('orchestrator.time.monotonic', side_effect=lambda: stop.now), patch('orchestrator.publish_worker_result', side_effect=publish):
+                publication_loop(db, {}, Mock(), Mock(), '', '', '', stop)
+            self.assertEqual(attempts, [0, 5, 15, 35, 75, 155, 315, 615, 915, 1215])
 
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
     def test_auto_policy_posts_without_review_approval(self, _trusted):
@@ -137,9 +177,11 @@ class MVPTests(unittest.TestCase):
                 raise TimeoutError()
             def list_reviews(_token, _path):
                 return [{'commit_id': HEAD, 'body': posted[0]['body']}]
-            with patch('orchestrator.publish_transport', side_effect=timeout_after_post) as post, \
+            stop = ThreePolls()
+            with patch('orchestrator.time.monotonic', side_effect=lambda: stop.count * 5), \
+                 patch('orchestrator.publish_transport', side_effect=timeout_after_post) as post, \
                  patch('orchestrator.review_list_transport', side_effect=list_reviews) as get:
-                publication_loop(db, {123: REPO}, github, auth, os.path.join(root, 'ledger2'), gate, 'test-secret', ThreePolls())
+                publication_loop(db, {123: REPO}, github, auth, os.path.join(root, 'ledger2'), gate, 'test-secret', stop)
                 self.assertEqual(post.call_count, 1)
                 self.assertEqual(get.call_count, 1)
                 with closing(sqlite3.connect(os.path.join(root, 'ledger2'))) as conn:

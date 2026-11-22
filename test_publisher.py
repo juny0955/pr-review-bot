@@ -299,6 +299,24 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(post.call_count, 1)
             self.assertGreaterEqual(MAX_RESPONSE, 600000)
 
+    def test_reconciliation_budgets_never_repost(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            post = Mock(side_effect=TimeoutError())
+            get = Mock(return_value=[{'body': 'other'}] * 10)
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=Path(directory) / 'ledger', get=get)
+            self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            with patch('publisher.time.monotonic', return_value=0):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            self.assertEqual(get.call_count, 3)
+            get.reset_mock()
+            with patch('publisher.time.monotonic', side_effect=[0, 0, 6]):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            self.assertEqual(get.call_count, 1)
+            post.assert_called_once()
+
     def test_fails_closed_without_durable_ledger(self):
         post = Mock()
         publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True)

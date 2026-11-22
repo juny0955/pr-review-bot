@@ -13,6 +13,7 @@ import json
 import sqlite3
 import uuid
 import re
+import time
 
 from repo_config import allowed
 
@@ -124,8 +125,12 @@ class GitHubPublisher:
             # A complete positive match is evidence of delivery; absence is not
             # evidence of non-delivery, even if every page was read successfully.
             try:
-                # ponytail: scan at most 10,000 reviews; larger histories need operator reconciliation.
-                for page in range(1, 1001):
+                # ponytail: only the first 30 reviews; deeper markers need operator reconciliation.
+                deadline = time.monotonic() + 5
+                for page in range(1, 4):
+                    # A single injected get must have its own timeout; this budget is between calls.
+                    if time.monotonic() >= deadline:
+                        break
                     reviews = self.get(f'{endpoint}?per_page=10&page={page}')
                     if not isinstance(reviews, list):
                         return 'ambiguous'
