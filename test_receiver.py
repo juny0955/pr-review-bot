@@ -38,6 +38,7 @@ class ReceiverTest(unittest.TestCase):
                 self.assertEqual(send(body, headers), 200)
                 with closing(sqlite3.connect(db)) as conn, conn:
                     self.assertEqual(conn.execute('SELECT delivery_id, body FROM queue').fetchall(), [('delivery-1', body)])
+                    self.assertEqual(conn.execute('SELECT delivery_id, signature FROM webhook_signatures').fetchall(), [('delivery-1', signature)])
             finally:
                 server.shutdown(); server.server_close(); thread.join()
 

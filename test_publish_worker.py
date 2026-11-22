@@ -17,6 +17,11 @@ RESULT = {'status': 'done', 'repo_id': 1, 'repository': REPO, 'number': 7, 'sha'
 
 
 class PublishWorkerTests(unittest.TestCase):
+    def test_mvp_requires_signed_event_and_exact_repository(self):
+        with self.assertRaises(ValueError):
+            self.publish(enabled=True, single_vps_mvp=True, webhook_secret='synthetic')
+        self.post.assert_not_called()
+
     def test_replaced_event_id_and_legacy_result_fail_closed(self):
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE queue SET body=?', (json.dumps(dict(EVENT, repository={'id': 2, 'full_name': REPO})),))

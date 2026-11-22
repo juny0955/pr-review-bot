@@ -1,6 +1,6 @@
 # prreview subprocess investigation (not enabled)
 
-Inspected installed Hermes source revision `bf0203a794a07aac3ff764972ab9087baa4e4f4e`. This is an implementation-specific finding, not a promise about other revisions. The MVP now permits normal authentication in the active prreview profile, without proving credential provenance. A Hermes profile is not a security sandbox; do not enable this in a service until OS-level isolation is implemented and independently verified.
+Inspected installed Hermes source revision `bf0203a794a07aac3ff764972ab9087baa4e4f4e`. This is an implementation-specific finding, not a promise about other revisions. The MVP permits normal authentication in the active prreview profile, without proving credential provenance. A Hermes profile is not a security sandbox. Single-VPS publication accepts this risk explicitly; separate accounts and OS isolation remain recommended upgrades, not MVP prerequisites.
 
 ## Findings
 
@@ -15,3 +15,9 @@ Run a dedicated pinned-version child, not `hermes chat` (an agent), with a fixed
 Pin `openai-codex` and `gpt-6.1-terra` in code; require affirmative diff/wiki transfer consent before spawning, pass bounded request over stdin, call the direct client once with no tools, and validate the finish reason, absence of tool calls, UTF-8 and output size. Parent must limit input and continuously bounded-read stdout/stderr, impose an independent monotonic wall deadline, kill and reap the entire child process group on timeout or output overflow, and treat all malformed, partial or failed results as errors. A request limit alone is not a guaranteed generation limit.
 
 Residual risk: neither the profile selector nor the resolver verifies credential provenance or rules out pool/fallback/refresh behavior. A fake resolver cannot prove this property. Stronger isolation would require an audited credential path and OS isolation that denies access to other credentials and files and constrains network, resources and descendants. No live key, wiki or network is needed or authorized for these tests.
+
+## Public review disclosure
+
+The publisher rejects a few recognizable credential patterns, including private-key headers, common provider tokens, bearer tokens and credential assignments, even in dry-run mode. This is a heuristic, not a secret scanner or proof that text is safe: it can reject harmless examples and miss other, encoded, fragmented or paraphrased secrets. It does not detect confidential wiki content or establish where text originated.
+
+Treat all generated review text as potentially derived from private wiki evidence. Consent to transfer wiki content to the model provider is not consent to publish it. An authorized human must review and approve the exact output and confirm every disclosure is appropriate for the repository's audience, or withhold approval. Publication of approved output can then run automatically in the explicit single-VPS mode. The system prompt and pattern check cannot guarantee safety; provider inference itself may disclose the diff and wiki before any publication check.

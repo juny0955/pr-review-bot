@@ -17,6 +17,15 @@ import re
 from repo_config import allowed
 
 SHA = re.compile(r'[0-9a-f]{40}\Z')
+# ponytail: known patterns only; use a maintained secret scanner for broader coverage.
+SECRET = re.compile(
+    r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|'
+    r'\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
+    r'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b|'
+    r'\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|'
+    r'''\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|passwd)\b["']?\s*[:=]\s*["']?[^\s"',;]{4,}''',
+    re.IGNORECASE,
+)
 
 
 def _require_operational_isolation():
@@ -40,9 +49,14 @@ def _guard_publish(publish_locked):
             raise ValueError('invalid base SHA')
         if not isinstance(review, str) or not review.strip() or len(review.encode('utf-8')) > 65536:
             raise ValueError('invalid review')
+        if SECRET.search(review):
+            raise ValueError('review contains a potential secret')
         if not self.enabled:
             return 'dry_run'
-        _require_operational_isolation()
+        if not self.single_vps_mvp:
+            _require_operational_isolation()
+        elif repo != 'juny0955/pr-review-bot':
+            raise ValueError('MVP repository not allowed')
         identity = [repo_id, repo, number, sha, base_sha, hashlib.sha256(review.encode('utf-8')).hexdigest()]
         # ponytail: one global lock serializes all posts; shard only if throughput requires it.
         with _require_revocation_gate(self.gate_path, identity):
@@ -51,8 +65,8 @@ def _guard_publish(publish_locked):
 
 
 class GitHubPublisher:
-    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None, gate_path=None):
-        if type(enabled) is not bool:
+    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None, gate_path=None, single_vps_mvp=False):
+        if type(enabled) is not bool or type(single_vps_mvp) is not bool:
             raise ValueError('enabled must be boolean')
         allowed(repos)
         self.post = post
@@ -62,6 +76,7 @@ class GitHubPublisher:
         self.ledger_path = ledger_path
         self.get = get
         self.gate_path = gate_path
+        self.single_vps_mvp = single_vps_mvp
 
     def publish(self, repo_id, repo, number, sha, review, *, base_sha=None):
         return self._publish_locked(repo_id, repo, number, sha, review, base_sha)

@@ -39,6 +39,7 @@ def create_server(secret, allowed_repos, db_path, port=8080):
     with closing(sqlite3.connect(db_path)) as db, db:
         db.execute('CREATE TABLE IF NOT EXISTS queue (delivery_id TEXT PRIMARY KEY, body BLOB NOT NULL, received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
         db.execute('CREATE TABLE IF NOT EXISTS tombstone (delivery_id TEXT PRIMARY KEY, body_hash BLOB NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS webhook_signatures (delivery_id TEXT PRIMARY KEY, signature TEXT NOT NULL)')
         db.execute('CREATE INDEX IF NOT EXISTS tombstone_body_hash ON tombstone(body_hash)')
 
     Outbox(db_path, repos=allowed_repos)
@@ -137,10 +138,12 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                                 db.execute('INSERT INTO tombstone(delivery_id, body_hash) VALUES (?, ?)',
                                            (row[0], hashlib.sha256(row[1]).digest()))
                                 db.execute('DELETE FROM work WHERE delivery_id=?', (row[0],))
+                                db.execute('DELETE FROM webhook_signatures WHERE delivery_id=?', (row[0],))
                                 db.execute('DELETE FROM queue WHERE delivery_id=?', (row[0],))
                         if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
                             raise sqlite3.OperationalError('queue full')
                     db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
+                    db.execute('INSERT INTO webhook_signatures VALUES (?, ?)', (delivery, signature))
                     db.execute("UPDATE outbox SET repo_id=?,repo_name=?,pr_number=? WHERE delivery_id=? AND event='detected'", (repo_id, repo, number, delivery))
                 return self.reply(202, 'queued')
             except sqlite3.Error:

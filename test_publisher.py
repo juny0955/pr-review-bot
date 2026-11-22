@@ -14,6 +14,22 @@ def fresh(**overrides):
 
 
 class DirectEntrySafetyTests(unittest.TestCase):
+    def test_secret_patterns_rejected_before_any_side_effect(self):
+        samples = ['-----BEGIN PRIVATE KEY-----', 'ghp_' + 'x' * 36,
+                   'github_pat_' + 'a' * 30, 'AKIA' + 'A' * 16,
+                   'sk-proj-' + 'a' * 30, 'Authorization: Bearer ' + 'x' * 20,
+                   '"api_key": "sample-value"', 'PASSWORD = sample-value']
+        for enabled in (False, True):
+            post, current = Mock(), Mock()
+            publisher = GitHubPublisher(post, current, POLICY, enabled=enabled)
+            for review in samples:
+                with self.subTest(enabled=enabled, review=review):
+                    with self.assertRaisesRegex(ValueError, 'potential secret') as error:
+                        publisher._publish_locked(ID, REPO, 1, SHA, review, 'b' * 40)
+                    self.assertNotIn(review, str(error.exception))
+            post.assert_not_called()
+            current.assert_not_called()
+
     def test_direct_locked_call_cannot_bypass_safety(self):
         import tempfile
         from pathlib import Path

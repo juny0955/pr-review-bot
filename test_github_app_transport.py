@@ -8,12 +8,37 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from github_app_transport import installation_transport, read_transport, MAX_RESPONSE, MAX_REQUEST, _https
+from github_app_transport import installation_transport, read_transport, publish_transport, review_list_transport, MAX_RESPONSE, MAX_REQUEST, _https
 from github_adapter import GitHubReadOnly
 from github_app_auth import InstallationAuth
 
 
 class TransportTests(unittest.TestCase):
+    def test_publish_and_list_transport_fail_closed(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review'}
+        response = {'id': 1, 'commit_id': 'a' * 40, 'body': 'review', 'state': 'COMMENTED'}
+        with patch('github_app_transport._request', return_value=response) as request:
+            self.assertEqual(publish_transport('fake-token', path, body), response)
+            request.assert_called_once_with('POST', path, 'fake-token', body)
+            for bad in ('https://evil.test' + path, path + '?per_page=100&page=1', '/repos/../repo/pulls/7/reviews'):
+                with self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', bad, body)
+            for bad in ({**body, 'event': 'APPROVE'}, {**body, 'commit_id': 'invalid'}, {**body, 'extra': 1}):
+                with self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', path, bad)
+            for bad in ({}, {**response, 'id': True}, {**response, 'commit_id': 'b' * 40}, {**response, 'state': 'PENDING'}):
+                request.return_value = bad
+                with self.assertRaisesRegex(RuntimeError, '^GitHub transport failed$'):
+                    publish_transport('fake-token', path, body)
+            request.return_value = [{'body': 'review'}]
+            self.assertEqual(review_list_transport('fake-token', path + '?per_page=100&page=1'), request.return_value)
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?page=1')
+            request.return_value = [None]
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=100&page=1')
+
     def connection(self, status=201, data=b'{}'):
         response = Mock(status=status)
         response.read.return_value = data
