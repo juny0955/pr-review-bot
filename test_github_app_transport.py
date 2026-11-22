@@ -70,7 +70,7 @@ class TransportTests(unittest.TestCase):
 
     def test_auth_with_test_key_and_mock_https_pins_repository_and_scope(self):
         response = {'token': 'test-token', 'expires_at': '2023-11-14T22:43:20Z',
-                    'permissions': {'pull_requests': 'read'},
+                    'permissions': {'pull_requests': 'read', 'contents': 'read'},
                     'repositories': [{'id': 12, 'full_name': 'owner/repo'}]}
         original = subprocess.Popen
         def selective(args, **kwargs):
@@ -119,14 +119,14 @@ class TransportTests(unittest.TestCase):
     def test_read_mode_uses_only_explicit_read_auth_and_blocks_git_fallback(self):
         auth = Mock(permission='read')
         auth.token.return_value = ('read-secret', 1)
-        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo'}}}
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo', 'private': False}}}
         with patch('github_adapter.read_transport', return_value=pr) as get, patch('github_adapter._gh_get') as gh, patch('github_adapter._pinned_diff') as git:
             adapter = GitHubReadOnly({12: 'owner/repo'}, auth=auth)
             self.assertEqual(adapter.current('owner/repo', 1)['repo_id'], 12)
             get.assert_called_once_with('read-secret', '/repos/owner/repo/pulls/1')
-            with self.assertRaises(RuntimeError):
-                adapter.diff('owner/repo', 1, 'a' * 40, 'b' * 40)
-            gh.assert_not_called(); git.assert_not_called()
+            adapter.diff('owner/repo', 1, 'a' * 40, 'b' * 40)
+            gh.assert_not_called()
+            git.assert_called_once_with('https://github.com/owner/repo.git', 1, 'a' * 40, 'b' * 40, public_only=True)
         with self.assertRaises(ValueError):
             GitHubReadOnly({12: 'owner/repo'}, auth=Mock(permission='write'))
 

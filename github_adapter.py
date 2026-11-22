@@ -1,6 +1,7 @@
 """Explicitly invoked, read-only GitHub adapter and offline request serializer."""
 import json
 import os
+import re
 import selectors
 import subprocess
 import time
@@ -14,9 +15,30 @@ from contextlib import ExitStack
 from worker import MAX_DIFF, SHA
 from repo_config import allowed
 from github_app_transport import read_transport
+from github_app_transport import installation_transport
+from github_app_auth import InstallationAuth
 
 MAX_METADATA = 256 * 1024
 TIMEOUT = 30
+
+
+def require_app_read_flag(enabled):
+    if not enabled and any(name in os.environ for name in (
+            'GITHUB_APP_ID', 'GITHUB_APP_INSTALLATION_ID', 'GITHUB_APP_KEY_PATH')):
+        raise ValueError('GitHub App read flag required')
+
+
+def app_read_auth(repos):
+    """Use local environment configuration only; never fall back to gh."""
+    app_id = os.environ.get('GITHUB_APP_ID', '')
+    installation_id = os.environ.get('GITHUB_APP_INSTALLATION_ID', '')
+    key_path = os.environ.get('GITHUB_APP_KEY_PATH', '')
+    if (not re.fullmatch(r'[1-9][0-9]{0,18}', app_id)
+            or not re.fullmatch(r'[1-9][0-9]{0,18}', installation_id)
+            or not key_path or '\0' in key_path):
+        raise ValueError('invalid App configuration')
+    return InstallationAuth(int(app_id), int(installation_id), key_path, repos,
+                            'read', installation_transport)
 
 
 def _gh_get(endpoint, accept, limit):
@@ -90,7 +112,7 @@ def _bounded_git_root():
     return path
 
 
-def _pinned_diff(remote, number, sha, base_sha):
+def _pinned_diff(remote, number, sha, base_sha, *, public_only=False):
     """Fetch into an isolated bare repository and diff immutable commit objects."""
     deadline = time.monotonic() + GIT_TIMEOUT
     with ExitStack() as stack:
@@ -104,11 +126,12 @@ def _pinned_diff(remote, number, sha, base_sha):
         env = {'PATH': os.defpath, 'HOME': directory, 'XDG_CONFIG_HOME': directory,
                'TMPDIR': directory,
                'GIT_CONFIG_NOSYSTEM': '1', 'GIT_TERMINAL_PROMPT': '0',
-               'GIT_ATTR_NOSYSTEM': '1', 'LC_ALL': 'C',
-               'GH_CONFIG_DIR': os.path.expanduser('~/.config/gh')}
-        for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
-            if name in os.environ:
-                env[name] = os.environ[name]
+               'GIT_ATTR_NOSYSTEM': '1', 'LC_ALL': 'C'}
+        if not public_only:
+            env['GH_CONFIG_DIR'] = os.path.expanduser('~/.config/gh')
+            for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+                if name in os.environ:
+                    env[name] = os.environ[name]
         def run(args, limit=4096):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -116,8 +139,10 @@ def _pinned_diff(remote, number, sha, base_sha):
             with tempfile.TemporaryFile(dir=directory) as output:
                 cmd = ['git', '-c', 'core.hooksPath=/dev/null',
                        '-c', 'protocol.ext.allow=never', '-c', 'diff.external=',
-                       '-c', 'credential.helper=',
-                       '-c', 'credential.helper=!gh auth git-credential', *args]
+                       '-c', 'http.followRedirects=false', '-c', 'credential.helper=']
+                if not public_only:
+                    cmd += ['-c', 'credential.helper=!gh auth git-credential']
+                cmd += args
                 proc = subprocess.Popen([sys.executable, '-I', os.path.join(os.path.dirname(__file__),
                                          'git_limited_exec.py'), str(MAX_GIT_FILE), str(GIT_TIMEOUT), *cmd],
                                         cwd=directory, env=env, stdin=subprocess.DEVNULL,
@@ -183,20 +208,21 @@ class GitHubReadOnly:
         repo_name = obj['base']['repo']['full_name']
         if type(repo_id) is not int or repo_name != repo or allowed(self.repos).get(repo_id) != repo:
             raise ValueError('GitHub repository identity mismatch')
+
         state, draft, sha = obj['state'], obj['draft'], obj['head']['sha']
         base_sha = obj['base']['sha']
         if (state not in ('open', 'closed') or type(draft) is not bool
                 or not isinstance(sha, str) or not SHA.fullmatch(sha)
                 or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
             raise ValueError('invalid GitHub PR response')
-        return {'state': state, 'draft': draft, 'sha': sha, 'base_sha': base_sha,
-                'repo_id': repo_id, 'repo': repo_name}
+        result = {'state': state, 'draft': draft, 'sha': sha, 'base_sha': base_sha,
+                  'repo_id': repo_id, 'repo': repo_name}
+        if self.auth is not None:
+            result['private'] = obj['base']['repo'].get('private')
+        return result
 
     def diff(self, repo, number, sha, base_sha):
-        endpoint = _endpoint(repo, number, self.repos)
-        if self.auth is not None:
-            # ponytail: fail closed until git fetch has isolated read-only credentials.
-            raise RuntimeError('App-authenticated diff unavailable')
+        _endpoint(repo, number, self.repos)
         if (not isinstance(sha, str) or not SHA.fullmatch(sha)
                 or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
             raise ValueError('invalid SHA')
@@ -204,4 +230,13 @@ class GitHubReadOnly:
         if (expected.get('state') != 'open' or expected.get('draft') is not False
                 or expected.get('sha') != sha or expected.get('base_sha') != base_sha):
             raise ValueError('stale or ineligible pull request')
-        return _pinned_diff('https://github.com/' + repo + '.git', number, sha, base_sha)
+        if self.auth is not None and expected.get('private') is not False:
+            raise ValueError('App Git fetch requires a public repository')
+        remote = 'https://github.com/' + repo + '.git'
+        if self.auth is None:
+            result = _pinned_diff(remote, number, sha, base_sha)
+        else:
+            result = _pinned_diff(remote, number, sha, base_sha, public_only=True)
+        if self.current(repo, number) != expected:
+            raise ValueError('pull request changed during fetch')
+        return result

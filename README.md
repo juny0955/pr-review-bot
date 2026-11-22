@@ -28,7 +28,7 @@ python3 receiver.py
 
 실험적 큐 보존: done/failed/skipped 결과는 완료 후 최소 7일 보존하며, 큐가 찼을 때만 삭제 조건을 충족한 만료 결과 중 가장 오래된 것 하나를 삭제하고 전달 ID와 본문 SHA-256 tombstone을 남깁니다. 만료된 결과는 백업되지 않았다면 복구할 수 없습니다. 대기·재시도·실행 중 작업, 완료 시각이 없는 결과, 연결된 outbox에 `sent`가 아닌 항목이 있는 결과는 삭제하지 않으며, 정리할 항목이 없으면 503으로 재시도를 요구합니다. 시계 오류는 보존 기간에 영향을 줍니다. Tombstone은 무기한 증가하고 SQLite 파일도 축소가 보장되지 않아 디스크가 무한 증가하거나 가득 찰 수 있습니다. 운영자는 디스크 사용량을 감시하고 안전한 백업 및 용량 계획을 마련해야 합니다. DB를 삭제하거나 오래된 백업으로 복원하면 이후 재전송 중복 방지 기록이 사라집니다. 이 정책은 프로덕션용 보존·감사 체계를 대체하지 않습니다.
 
-`model_adapter.DirectInferenceAdapter`는 명시적으로 활성화하는 실험용 직접 클라이언트 어댑터로, 안전하게 거부하는 `LocalOnlyModelAdapter`와는 별개입니다. `resolve_hermes_direct_adapter()`는 설치된 Hermes 보조 클라이언트에 `openai-codex` 제공자와 `gpt-6.1-terra`를 명시하여 사용합니다. 에이전트를 실행하거나 도구를 제공하지는 않습니다. diff와 wiki 데이터를 제공자에게 전송하므로 허가를 받은 경우에만 사용하세요. 출력은 신뢰할 수 없으며 자동으로 게시해서는 안 됩니다. OS 차원의 자격 증명 분리나 프롬프트 인젝션 방어가 보장되는 것은 아닙니다. 입력과 허용되는 출력의 크기는 제한되지만, Hermes Codex 전송 계층이 요청된 토큰 제한을 생략하므로 생성 자체에는 토큰 상한이 적용되지 않습니다(요청에는 시간 제한이 있습니다). 이 리졸버는 설치된 Hermes 환경과 설정된 자격 증명에 의존합니다. 테스트는 클라이언트를 주입하므로 둘 다 필요하지 않습니다.
+`resolve_hermes_direct_adapter()`는 활성 프로필이 prreview인 경우 정상 Hermes 인증 경로로 gpt-6.1-terra를 사용합니다. 프로필은 보안 샌드박스가 아니며 공유 인증으로 fallback할 수 있습니다: https://hermes-agent.nousresearch.com/docs/user-guide/profiles. `DirectInferenceAdapter`는 신뢰할 수 있는 클라이언트를 직접 주입하는 실험용 어댑터이며 wiki가 비어 있어도 `authorize_wiki_transfer=True`가 필요합니다. 이는 인증 경계가 아닙니다. 프롬프트 인젝션 방어는 보장되지 않고 출력은 신뢰할 수 없습니다. 자동 게시하지 마세요. 테스트는 mock만 사용합니다.
 
 ## Git diff 임시 저장소 요구 사항
 
@@ -40,9 +40,9 @@ python3 receiver.py
 
 ## GitHub App 인증 실험 모듈
 
-`github_app_auth.InstallationAuth(app_id, installation_id, key_path, repos, purpose, transport)`는 명시적으로 호출할 때만 단일 허용 저장소의 설치 토큰을 요청합니다. `purpose`는 `read` 또는 `publish`이며 각각 pull requests 읽기 또는 쓰기 권한만 요청합니다(자동 부여되는 metadata 읽기만 추가 허용). 읽기와 게시용으로 별도 App/설치/키 및 프로세스를 사용하는 것은 호출자와 운영자의 책임입니다. `token(repo_id, full_name)`은 토큰과 Unix 만료 시각을 반환하고 캐시하지 않습니다. RS256 JWT의 유효 기간은 10분이며 RSA 2048~8192비트, 유효 UID 소유의 일반 파일, 그룹/기타 접근 금지 및 최종 경로 심볼릭 링크 금지를 검사합니다. Linux `/proc/self/fd`와 openssl이 필요합니다. 키의 상위 디렉터리는 신뢰된 사용자만 변경할 수 있어야 하고 동일 UID 및 특권 프로세스는 신뢰합니다.
+`github_app_auth.InstallationAuth(app_id, installation_id, key_path, repos, purpose, transport)`는 단일 허용 저장소의 설치 토큰을 요청합니다. `read`는 pull requests와 contents 읽기, `publish`는 pull requests 쓰기를 요청합니다(자동 부여 metadata 읽기 허용). 토큰은 캐시하지 않습니다. RSA 2048~8192비트 개인 키, Linux `/proc/self/fd`와 openssl이 필요하며 키와 상위 디렉터리를 보호해야 합니다.
 
-명시적으로 주입 가능한 읽기 전용 HTTP 전송과 App 인증 `current()`는 구현되어 있으나 워커/게시자에 운영 연결되어 있지 않으며 App 인증 `diff()`는 안전하게 거부합니다. 전송과 제약은 `GITHUB_APP_TRANSPORT.md`를 참조하세요. transport 자체의 로깅과 비밀 보관을 막을 수 없고 반환 토큰도 호출자가 보호해야 합니다. 시계 동기화, App 설치 자체의 최소 권한, 키 교체·폐기 및 프로세스 격리도 별도로 필요합니다. API 호환성과 실제 설치 권한은 아직 실환경 검증되지 않았습니다. 게시 활성화는 구현하거나 설정하지 않았습니다. 테스트에는 임시 RSA 키와 mock API만 사용합니다.
+App 환경변수가 하나도 없으면 기본 CLI는 gh를 사용합니다. runner와 orchestrator에서 `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_KEY_PATH` 중 하나라도 존재하면(빈 값 포함) `--github-app-read`가 필수이며, 누락 시 고정 오류로 종료하고 gh로 대체하지 않습니다. App 읽기 인증을 사용하려면 세 변수를 모두 로컬 프로세스 환경에 설정하세요. 키나 토큰을 명령 인자 또는 저장소에 넣지 마세요. 명시적 App 설정이 불완전해도 실패합니다. 토큰은 단일 허용 저장소에 대한 읽기 권한만 요청하고 Git diff fetch는 공개 저장소에서 익명으로만 수행합니다. fetch 전후 repo ID와 PR 상태 및 전체 SHA를 검증하고 리다이렉트를 거부하지만 저장소 이름 재사용 ABA 경쟁은 원자적으로 막지 못합니다. 전송과 제약은 `GITHUB_APP_TRANSPORT.md`를 참조하세요. 실제 설치 권한과 API 호환성은 검증되지 않았습니다. 실제 게시 잠금은 유지되며 테스트는 합성 키와 mock만 사용합니다.
 
 ## 제한 사항
 

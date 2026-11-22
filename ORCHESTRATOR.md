@@ -1,6 +1,8 @@
 # Continuous dry-run worker
 
-This is an explicitly started process, not a service installer. It consumes the existing SQLite queue, stores reviews locally, and never invokes the GitHub publisher. Dry-run does **not** mean offline: the explicit inference flags authorize transmitting PR diffs and wiki evidence to the configured model provider, and GitHub is read over the network. Follow the GitHub adapter's scratch and authentication setup in README.md first.
+The resolver requires active profile `prreview` and uses normal Hermes authentication for `gpt-6.1-terra`. This is not a security sandbox; credentials may fall back to shared state. This explicitly started process stores reviews locally and never invokes the publisher. Dry-run is not offline. The CLI uses gh only when no App environment variables exist; otherwise `--github-app-read` is required, including for empty variables. Follow README.md for scratch and authentication setup.
+
+Startup returns `isolation_unavailable` if the required profile or model client is unavailable. Earlier failures produce an argument error or `error`. Explicit inference and wiki-transfer approvals remain required.
 
 ```
 python orchestrator.py --db /path/to/queue.db --wiki /path/to/wiki --repos /path/to/repos.json \

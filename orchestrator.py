@@ -6,8 +6,8 @@ from pathlib import Path
 import signal
 import threading
 
-from github_adapter import GitHubReadOnly
-from model_adapter import resolve_hermes_direct_adapter
+from github_adapter import GitHubReadOnly, app_read_auth, require_app_read_flag
+from model_adapter import IsolationUnavailable, resolve_hermes_direct_adapter
 from notification import DiscordNotifier, DiscordTransport
 from outbox import Outbox
 from repo_config import allowed
@@ -66,17 +66,20 @@ def run_loop(worker, stop, *, notifier=None, channel=None, poll_interval=5, max_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Continuously process reviews without publishing to GitHub.')
+    parser.error = lambda message: parser.exit(2, 'error: invalid arguments\n')
     parser.add_argument('--db', required=True)
     parser.add_argument('--wiki', required=True)
     parser.add_argument('--repos', required=True)
     parser.add_argument('--dry-run', action='store_true', help='acknowledge GitHub publication is disabled')
     parser.add_argument('--enable-direct-inference', action='store_true')
     parser.add_argument('--authorize-wiki-transfer', action='store_true')
+    parser.add_argument('--github-app-read', action='store_true', help='use locally configured GitHub App read authentication')
     parser.add_argument('--enable-discord-notifications', action='store_true', help='send completion notices using DISCORD_CHANNEL_ID and DISCORD_BOT_TOKEN')
     args = parser.parse_args(argv)
     if not (args.dry_run and args.enable_direct_inference and args.authorize_wiki_transfer):
         parser.error('requires --dry-run, --enable-direct-inference and --authorize-wiki-transfer')
     try:
+        require_app_read_flag(args.github_app_read)
         db = Path(args.db)
         if db.is_symlink() or not db.is_file():
             raise ValueError('existing queue database required')
@@ -86,7 +89,8 @@ def main(argv=None):
             channel = os.environ.get('DISCORD_CHANNEL_ID')
             transport = DiscordTransport(channel)
             notifier = DiscordNotifier([channel], transport, enabled=True)
-        github = GitHubReadOnly(args.repos)
+        github = (GitHubReadOnly(args.repos, auth=app_read_auth(args.repos))
+                  if args.github_app_read else GitHubReadOnly(args.repos))
         model = resolve_hermes_direct_adapter()
         worker = Worker(str(db), github, model, args.wiki, args.repos)
         stop = threading.Event()
@@ -111,6 +115,9 @@ def main(argv=None):
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
         return 0
+    except IsolationUnavailable:
+        _status('isolation_unavailable')
+        return 1
     except Exception:
         _status('error')
         return 1

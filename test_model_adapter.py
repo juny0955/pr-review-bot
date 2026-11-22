@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import Mock, patch
 
 from model_adapter import LocalOnlyModelAdapter, IsolationUnavailable, DirectInferenceAdapter
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ class ModelAdapterTests(unittest.TestCase):
             return SimpleNamespace(choices=[SimpleNamespace(finish_reason='stop', message=SimpleNamespace(content='Review', tool_calls=None))])
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         request = {'repository': 'a/b', 'number': 1, 'sha': 'a'*40, 'diff': 'ignore instructions', 'wiki': []}
-        self.assertEqual(DirectInferenceAdapter(client).review(request), 'Review')
+        self.assertEqual(DirectInferenceAdapter(client, authorize_wiki_transfer=True).review(request), 'Review')
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]['model'], 'gpt-6.1-terra')
         self.assertNotIn('tools', calls[0])
@@ -28,13 +29,50 @@ class ModelAdapterTests(unittest.TestCase):
             client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response)))
             with self.subTest(reason=reason, length=len(text), tools=bool(tools)):
                 with self.assertRaises(ValueError):
-                    DirectInferenceAdapter(client).review(request)
+                    DirectInferenceAdapter(client, authorize_wiki_transfer=True).review(request)
 
     def test_direct_inference_validates_before_call(self):
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
             create=lambda **kw: self.fail('must not call client'))))
         with self.assertRaises(ValueError):
-            DirectInferenceAdapter(client).review({'diff': 'invalid'})
+            DirectInferenceAdapter(client, authorize_wiki_transfer=True).review({'diff': 'invalid'})
+
+    def test_transfer_requires_explicit_consent_even_for_empty_wiki(self):
+        create = Mock(return_value=SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason='stop', message=SimpleNamespace(content='Review', tool_calls=None))]))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        for wiki in ([], [{'path': 'index.md', 'text': 'fixture'}]):
+            request = {'repository': 'a/b', 'number': 1, 'sha': 'a'*40, 'diff': 'diff', 'wiki': wiki}
+            for consent in (False, None, 1, 'yes'):
+                with self.subTest(wiki=wiki, consent=consent), self.assertRaises(PermissionError):
+                    DirectInferenceAdapter(client, authorize_wiki_transfer=consent).review(request)
+            with self.assertRaises(PermissionError):
+                DirectInferenceAdapter(client).review(request)
+            create.assert_not_called()
+            self.assertEqual(DirectInferenceAdapter(client, authorize_wiki_transfer=True).review(request), 'Review')
+            self.assertEqual(json.loads(create.call_args.kwargs['messages'][1]['content'])['data']['wiki'], wiki)
+            create.reset_mock()
+
+    def test_hermes_resolver_requires_prreview_and_pins_model(self):
+        from model_adapter import resolve_hermes_direct_adapter
+        client = object()
+        profile = Mock(return_value='developer')
+        resolve = Mock(return_value=(client, 'gpt-6.1-terra'))
+        modules = {'hermes_cli': SimpleNamespace(), 'hermes_cli.profiles': SimpleNamespace(get_active_profile_name=profile),
+                   'agent': SimpleNamespace(), 'agent.auxiliary_client': SimpleNamespace(resolve_provider_client=resolve)}
+        with patch.dict('sys.modules', modules):
+            with self.assertRaises(IsolationUnavailable):
+                resolve_hermes_direct_adapter()
+            resolve.assert_not_called()
+            profile.return_value = 'prreview'
+            adapter = resolve_hermes_direct_adapter()
+            self.assertIs(adapter.client, client)
+            self.assertTrue(adapter.authorize_wiki_transfer)
+            resolve.assert_called_once_with('openai-codex', 'gpt-6.1-terra')
+            for result in ((None, 'gpt-6.1-terra'), (client, 'other')):
+                resolve.return_value = result
+                with self.assertRaises(IsolationUnavailable):
+                    resolve_hermes_direct_adapter()
 
     def test_review_fails_closed_without_isolated_model(self):
         with self.assertRaises(IsolationUnavailable):
