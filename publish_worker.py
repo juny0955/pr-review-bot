@@ -2,7 +2,7 @@
 
 The approval callback is only an additional veto, never evidence for the gate.
 Single-VPS publication is an explicit opt-in and does not provide account isolation.
-Queue retention may delete old results, which then fail closed.
+Done results are retained indefinitely; skipped and failed results may expire at capacity.
 """
 from contextlib import closing
 import json

@@ -57,6 +57,20 @@ class MVPTests(unittest.TestCase):
                     if proc.is_alive(): proc.terminate()
                     proc.join()
 
+    def test_ambiguous_is_rechecked_in_same_process_until_sent(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
+            db = os.path.join(root, 'queue')
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT)')
+                conn.execute("INSERT INTO work VALUES ('delivery', 'done')")
+            class Stop:
+                def __init__(self): self.polls = 0
+                def is_set(self): return self.polls >= 3
+                def wait(self, _): self.polls += 1
+            with patch('orchestrator.publish_worker_result', side_effect=['ambiguous', 'sent']) as publish:
+                publication_loop(db, {}, Mock(), Mock(), '', '', '', Stop())
+            self.assertEqual(publish.call_count, 2)
+
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
     def test_auto_policy_posts_without_review_approval(self, _trusted):
         from publisher import GitHubPublisher
@@ -113,10 +127,28 @@ class MVPTests(unittest.TestCase):
                     publication_loop(db, {123: REPO}, github, auth, ledger, gate, 'test-secret', Once())
                 self.assertEqual(post.call_count, 1)
                 self.assertEqual(post.call_args.args[1], '/repos/' + REPO + '/pulls/7/reviews')
+            class ThreePolls:
+                def __init__(self): self.count = 0
+                def is_set(self): return self.count >= 3
+                def wait(self, _): self.count += 1
+            posted = []
+            def timeout_after_post(_token, _path, body):
+                posted.append(body)
+                raise TimeoutError()
+            def list_reviews(_token, _path):
+                return [{'commit_id': HEAD, 'body': posted[0]['body']}]
+            with patch('orchestrator.publish_transport', side_effect=timeout_after_post) as post, \
+                 patch('orchestrator.review_list_transport', side_effect=list_reviews) as get:
+                publication_loop(db, {123: REPO}, github, auth, os.path.join(root, 'ledger2'), gate, 'test-secret', ThreePolls())
+                self.assertEqual(post.call_count, 1)
+                self.assertEqual(get.call_count, 1)
+                with closing(sqlite3.connect(os.path.join(root, 'ledger2'))) as conn:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM publications WHERE state='sent'").fetchone()[0], 1)
+            with patch('orchestrator.publish_transport') as post:
                 with closing(sqlite3.connect(db)) as conn, conn:
                     conn.execute('UPDATE webhook_signatures SET signature=?', ('sha256=' + '0' * 64,))
                 publication_loop(db, {123: REPO}, github, auth, ledger, gate, 'test-secret', Once())
-                self.assertEqual(post.call_count, 1)
+                self.assertEqual(post.call_count, 0)
 
 
 if __name__ == '__main__':

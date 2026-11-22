@@ -1,9 +1,9 @@
 """Local-only GitHub pull request webhook intake; no outbound operations.
 
-At capacity, terminal work at least seven days old is replaced transactionally with permanent SHA-256
-tombstones. This bounds queue rows, not tombstone or SQLite disk usage; backups
-and disk monitoring are operator responsibilities. Results can be deleted at
-capacity after the retention period. A restored or deleted database loses replay history since its backup.
+At capacity, terminal skipped or failed work at least seven days old is replaced transactionally with permanent SHA-256
+tombstones. Done results are retained indefinitely because publication uses a separate ledger.
+This bounds queue rows, not tombstone or SQLite disk usage; backups
+and disk monitoring are operator responsibilities. A restored or deleted database loses replay history since its backup.
 The signature authenticates the body, not the delivery ID; tombstones cannot
 prevent replay after database loss or protect against a compromised secret.
 Pending, retrying, and leased work is never evicted; saturation returns 503.
@@ -129,7 +129,7 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                         # tombstones grow indefinitely to preserve replay defense.
                         if 'completed_at' in {r[1] for r in db.execute('PRAGMA table_info(work)')}:
                             row = db.execute("""SELECT q.delivery_id, q.body FROM queue q JOIN work w
-                                ON w.delivery_id=q.delivery_id WHERE w.status IN ('done','skipped','failed')
+                                ON w.delivery_id=q.delivery_id WHERE w.status IN ('skipped','failed')
                                 AND w.completed_at <= CAST(strftime('%s','now') AS INTEGER) - 7 * 86400
                                 AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.delivery_id=q.delivery_id
                                     AND o.status IS NOT 'sent')

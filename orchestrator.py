@@ -43,6 +43,7 @@ def notification_loop(outbox, notifier, channel, stop, *, poll_interval=5):
 def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_interval=5):
     # ponytail: scan completed jobs; the ledger prevents repeat POSTs after restart.
     finished = set()
+    ambiguous = set()  # ponytail: log once per unresolved job; restart resets suppression.
     errors = set()  # ponytail: one error per job until recovery; restart resets suppression.
     poll_error = False
     while not stop.is_set():
@@ -51,6 +52,8 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
                 ids = [row[0] for row in conn.execute("SELECT delivery_id FROM work WHERE status='done'")]
             poll_error = False
             errors.intersection_update(ids)
+            ambiguous.intersection_update(ids)
+            finished.intersection_update(ids)
             for delivery in ids:
                 if delivery in finished or stop.is_set():
                     continue
@@ -69,9 +72,14 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
                         repos=repos, get=get, ledger_path=ledger, gate_path=gate, enabled=True,
                         approve=lambda *args: True, single_vps_mvp=True, webhook_secret=secret)
                     errors.discard(delivery)
-                    if result in ('sent', 'ambiguous'):
+                    if result == 'sent':
                         finished.add(delivery)
-                    _status('publication_' + result)
+                    if result != 'ambiguous' or delivery not in ambiguous:
+                        _status('publication_' + result)
+                    if result == 'ambiguous':
+                        ambiguous.add(delivery)
+                    else:
+                        ambiguous.discard(delivery)
                 except Exception:
                     if delivery not in errors:
                         _status('publication_error')

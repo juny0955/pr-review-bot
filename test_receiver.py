@@ -107,12 +107,27 @@ class SecurityTest(unittest.TestCase):
             self.assertEqual(self.send(overrides={'X-GitHub-Delivery': 'other'}), 200)
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
 
-    def test_completed_work_cleanup_preserves_replay_and_delivery_conflict(self):
+    def test_old_done_result_is_not_evicted_even_after_notifications_sent(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
         worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute('UPDATE work SET completed_at=0')
+            db.execute("UPDATE outbox SET status='sent'")
+        with patch('receiver.MAX_QUEUE', 1):
+            self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT status FROM work').fetchone(), ('done',))
+            self.assertIsNotNone(db.execute('SELECT body FROM queue').fetchone())
+
+    def test_completed_work_cleanup_preserves_replay_and_delivery_conflict(self):
+        from worker import Worker
+        self.assertEqual(self.send(), 202)
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        claim = worker.claim()
+        self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         from outbox import Outbox
         messages = []
         box = Outbox(self.db, repos={123: 'acme/repo'})
@@ -128,7 +143,7 @@ class SecurityTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as db:
             self.assertIsNone(db.execute("SELECT 1 FROM queue WHERE delivery_id='test-id'").fetchone())
             self.assertEqual(db.execute("SELECT event,repo_id,repo_name,pr_number FROM outbox WHERE delivery_id='test-id' ORDER BY id").fetchall(),
-                             [('detected', 123, 'acme/repo', 1), ('started', 123, 'acme/repo', 1), ('completed', 123, 'acme/repo', 1)])
+                             [('detected', 123, 'acme/repo', 1), ('started', 123, 'acme/repo', 1), ('failed', 123, 'acme/repo', 1)])
         self.assertTrue(all('acme/repo #1' in message for message in messages))
 
     def test_cleanup_preserves_every_unsent_outbox_source(self):
@@ -193,7 +208,7 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.send(), 202)
         worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
         claim = worker.claim()
-        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
             db.execute("UPDATE outbox SET status='sent'")
@@ -214,7 +229,7 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.send(), 202)
         worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
         claim = worker.claim()
-        self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
+        self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('UPDATE work SET completed_at=0')
             db.execute("UPDATE outbox SET status='sent'")
