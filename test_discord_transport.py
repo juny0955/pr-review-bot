@@ -20,6 +20,8 @@ class DiscordTransportTests(unittest.TestCase):
         self.assertEqual(request.full_url, 'https://discord.com/api/v10/channels/123/messages')
         self.assertEqual(request.get_method(), 'POST')
         self.assertEqual(request.get_header('Authorization'), 'Bot secret')
+        self.assertEqual(request.get_header('User-agent'), 'PRReviewBot/1.0')
+        self.assertEqual(request.get_header('Content-type'), 'application/json')
         self.assertEqual(json.loads(request.data), {'content': 'hello', 'allowed_mentions': {'parse': []}})
         self.assertGreater(opener.call_args.kwargs['timeout'], 0)
 
@@ -45,6 +47,22 @@ class DiscordTransportTests(unittest.TestCase):
                 notifier.notify('123', 'hello')
             self.assertNotIn('secret', str(caught.exception))
             self.assertIsNone(caught.exception.__cause__)
+
+    def test_other_responses_keep_existing_behavior(self):
+        for status in (204, 299, 300, 403, 500):
+            with self.subTest(status=status):
+                response = Mock(status=status)
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                transport = DiscordTransport('123', environ={'DISCORD_BOT_TOKEN': 'secret'}, open_request=Mock(return_value=response))
+                notifier = DiscordNotifier({'123'}, transport, enabled=True)
+                if status < 300:
+                    self.assertEqual(notifier.notify('123', 'hello'), 'sent')
+                else:
+                    with self.assertRaises(NotificationError) as caught:
+                        notifier.notify('123', 'hello')
+                    self.assertEqual(str(caught.exception), 'Discord notification failed')
+                    self.assertNotIn('secret', ''.join(traceback.format_exception(caught.exception)))
 
     def test_http_protocol_errors_are_sanitized(self):
         for error in (http.client.BadStatusLine('secret'), http.client.IncompleteRead(b'secret')):
