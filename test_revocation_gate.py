@@ -64,18 +64,25 @@ class GateTests(unittest.TestCase):
                 update_gate(self.path, {str(ID): REPO}, [ENTRY], expected=gate_snapshot(self.path)[1])
                 # Each case needs an unclaimed review.
                 self.pub.ledger_path = self.path / ('ledger-policy' if policy_revoke else 'ledger-approval')
-                started, done = mp.Event(), mp.Event()
-                proc = mp.Process(target=revoke, args=(self.path, started, done, policy_revoke))
+                # A fork would inherit the held flock and keep it alive in the child.
+                ctx = mp.get_context('spawn')
+                started, done = ctx.Event(), ctx.Event()
+                proc = ctx.Process(target=revoke, args=(self.path, started, done, policy_revoke))
                 def post(*args):
                     proc.start()
                     self.assertTrue(started.wait(3))
                     self.assertFalse(done.wait(.3))
                 self.post.side_effect = post
-                self.assertEqual(self.publish(), 'sent')
-                proc.join(3)
-                self.assertEqual(proc.exitcode, 0)
-                self.assertTrue(done.is_set())
-                with self.assertRaises(ValueError): self.publish()
+                try:
+                    self.assertEqual(self.publish(), 'sent')
+                    proc.join(3)
+                    self.assertEqual(proc.exitcode, 0)
+                    self.assertTrue(done.is_set())
+                    with self.assertRaises(ValueError): self.publish()
+                finally:
+                    if proc.pid is not None:
+                        if proc.is_alive(): proc.terminate()
+                        proc.join()
 
     def test_evidence_identity_and_malformed_state(self):
         for index, value in ((0, 13), (1, 'other/repo'), (2, 2), (3, 'c' * 40), (4, 'c' * 40), (5, 'f' * 64)):
