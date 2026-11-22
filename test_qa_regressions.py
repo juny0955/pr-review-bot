@@ -10,10 +10,27 @@ import orchestrator as o
 
 
 class RegressionTests(unittest.TestCase):
+    def test_job_error_test_closes_all_database_connections(self):
+        connections = []
+        class Connection(sqlite3.Connection):
+            closed = False
+            def close(self):
+                self.closed = True
+                super().close()
+        connect = sqlite3.connect
+        def tracked_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs, factory=Connection)
+            connections.append(conn)
+            return conn
+        with patch('sqlite3.connect', side_effect=tracked_connect):
+            self.test_job_errors_are_safe_rate_limited_and_do_not_block_other_jobs()
+        self.assertTrue(connections)
+        self.assertTrue(all(conn.closed for conn in connections))
+
     def test_job_errors_are_safe_rate_limited_and_do_not_block_other_jobs(self):
         with tempfile.TemporaryDirectory() as root:
             db = os.path.join(root, 'queue')
-            with sqlite3.connect(db) as conn:
+            with contextlib.closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE work(delivery_id TEXT, status TEXT)')
                 conn.executemany('INSERT INTO work VALUES (?, ?)', [('bad', 'done'), ('good', 'done')])
             class Stop:

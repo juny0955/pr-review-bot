@@ -10,7 +10,16 @@ import unittest
 from unittest.mock import Mock, patch
 
 from orchestrator import publication_loop
-from revocation_gate import update_gate
+from revocation_gate import update_gate, gate_snapshot, authorize, locked_gate
+import multiprocessing as mp
+
+
+def revoke_auto(path, started, done):
+    started.set()
+    with patch('revocation_gate._trusted_directory', side_effect=lambda p: os.open(p, os.O_RDONLY | os.O_DIRECTORY)):
+        _, version = gate_snapshot(path)
+        update_gate(path, {'123': REPO}, [], auto_repos={}, expected=version)
+    done.set()
 
 REPO = 'juny0955/pr-review-bot'
 HEAD, BASE = 'a' * 40, 'b' * 40
@@ -18,14 +27,65 @@ HEAD, BASE = 'a' * 40, 'b' * 40
 
 class MVPTests(unittest.TestCase):
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
-    def test_signed_approved_result_posts_once_and_rejects_tampering(self, _trusted):
+    def test_auto_policy_revocation_and_scope(self, _trusted):
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as gate:
+            open(os.path.join(gate, 'lock'), 'w').close()
+            os.chmod(os.path.join(gate, 'lock'), 0o600)
+            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
+            identity = [123, REPO, 7, HEAD, BASE, 'c' * 64]
+            with self.assertRaises(ValueError):
+                with authorize(gate, identity): pass
+            with authorize(gate, identity, single_vps_mvp=True): pass
+            with self.assertRaises(ValueError):
+                with authorize(gate, [124, REPO, *identity[2:]], single_vps_mvp=True): pass
+            ctx = mp.get_context('spawn')
+            started, done = ctx.Event(), ctx.Event()
+            proc = ctx.Process(target=revoke_auto, args=(gate, started, done))
+            try:
+                with authorize(gate, identity, single_vps_mvp=True):
+                    proc.start()
+                    self.assertTrue(started.wait(3))
+                    self.assertFalse(done.wait(.3))
+                proc.join(3)
+                self.assertEqual(proc.exitcode, 0)
+                with self.assertRaises(ValueError):
+                    with authorize(gate, identity, single_vps_mvp=True): pass
+                with self.assertRaises(ValueError):
+                    update_gate(gate, {'123': REPO}, [], auto_repos={'123': 'other/repo'}, expected=gate_snapshot(gate)[1])
+            finally:
+                if proc.pid is not None:
+                    if proc.is_alive(): proc.terminate()
+                    proc.join()
+
+    @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+    def test_auto_policy_posts_without_review_approval(self, _trusted):
+        from publisher import GitHubPublisher
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as gate:
+            open(os.path.join(gate, 'lock'), 'w').close()
+            os.chmod(os.path.join(gate, 'lock'), 0o600)
+            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
+            post = Mock(side_effect=TimeoutError())
+            current = Mock(return_value={'repo_id': 123, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE})
+            pub = GitHubPublisher(post, current, {123: REPO}, enabled=True, single_vps_mvp=True,
+                                  gate_path=gate, ledger_path=os.path.join(gate, 'ledger'), get=lambda _: [])
+            with self.assertRaises(ValueError):
+                pub.publish(123, REPO, 7, HEAD, 'password=supersecret', base_sha=BASE)
+            current.return_value['base_sha'] = 'c' * 40
+            with self.assertRaises(ValueError): pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE)
+            current.return_value['base_sha'] = BASE
+            self.assertEqual(pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
+            self.assertEqual(pub.publish(123, REPO, 7, HEAD, 'review', base_sha=BASE), 'ambiguous')
+            post.assert_called_once()
+
+    @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+    def test_signed_auto_result_posts_once_and_rejects_tampering(self, _trusted):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
             gate = os.path.join(root, 'gate')
             os.mkdir(gate, 0o700)
             open(os.path.join(gate, 'lock'), 'w').close()
             os.chmod(os.path.join(gate, 'lock'), 0o600)
             review = 'Check the boundary condition.'
-            update_gate(gate, {'123': REPO}, [[123, REPO, 7, HEAD, BASE, hashlib.sha256(review.encode()).hexdigest()]])
+            update_gate(gate, {'123': REPO}, [], auto_repos={'123': REPO})
             db = os.path.join(root, 'queue')
             ledger = os.path.join(root, 'ledger')
             event = {'repository': {'id': 123, 'full_name': REPO}, 'number': 7,

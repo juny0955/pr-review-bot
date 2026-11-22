@@ -33,9 +33,9 @@ def _require_operational_isolation():
     raise ValueError('publication disabled: operational isolation not implemented')
 
 
-def _require_revocation_gate(path, identity):
+def _require_revocation_gate(path, identity, *, single_vps_mvp=False):
     from revocation_gate import authorize
-    return authorize(path, identity)
+    return authorize(path, identity, single_vps_mvp=single_vps_mvp)
 
 
 def _guard_publish(publish_locked):
@@ -59,7 +59,7 @@ def _guard_publish(publish_locked):
             raise ValueError('MVP repository not allowed')
         identity = [repo_id, repo, number, sha, base_sha, hashlib.sha256(review.encode('utf-8')).hexdigest()]
         # ponytail: one global lock serializes all posts; shard only if throughput requires it.
-        with _require_revocation_gate(self.gate_path, identity):
+        with _require_revocation_gate(self.gate_path, identity, single_vps_mvp=self.single_vps_mvp):
             return publish_locked(self, repo_id, repo, number, sha, review, base_sha)
     return guarded
 

@@ -79,7 +79,7 @@ class Outbox:
             return None
         ident, event, token, repo_id, name, number = claim
         messages = {'detected': 'PR detected.', 'started': 'PR review started.',
-                    'completed': 'PR review completed (dry run).', 'failed': 'PR review failed.'}
+                    'completed': 'PR review completed.', 'failed': 'PR review failed.'}
         try:
             policy = allowed(self.repos)
         except Exception:

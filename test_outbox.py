@@ -97,7 +97,7 @@ class OutboxTest(unittest.TestCase):
                 box = Outbox(db, repos=policy)
                 for _ in range(3):
                     self.assertEqual(box.send_once(lambda message: deliver_notification(notifier, '123', message)), 'sent')
-                self.assertEqual([item['content'] for item in sent], [message + ' `example-owner/example-repo #1` (repository ID 123)' for message in ['PR detected.', 'PR review started.', 'PR review completed (dry run).']])
+                self.assertEqual([item['content'] for item in sent], [message + ' `example-owner/example-repo #1` (repository ID 123)' for message in ['PR detected.', 'PR review started.', 'PR review completed.']])
                 self.assertTrue(all(item['allowed_mentions'] == {'parse': []} for item in sent))
             finally:
                 server.shutdown()
