@@ -2,6 +2,7 @@
 from contextlib import closing
 import json
 import itertools
+import codecs
 import stat
 import os
 from pathlib import Path
@@ -20,14 +21,25 @@ MAX_REVIEW = 65536
 
 
 def wiki_evidence(root, query=''):
-    """Read the vault's wiki/ articles (or an article directory), never symlinks.
-
-    Scan at most 500 directory entries, prioritizing the index and keyword
-    matches. Paths are relative to the configured root for provenance.
-    """
+    """Select bounded chunks of top-level Markdown without following symlinks."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        root_fd = os.open(root, flags)
+        parts = os.fspath(root).split(os.sep)
+        if '..' in parts:
+            raise ValueError('wiki directory unavailable')
+        anchor = '/' if os.path.isabs(root) else '.'
+        root_fd = os.open(anchor, flags)
+        directories: list[tuple[int | None, str, int]] = [(None, anchor, root_fd)]
+        try:
+            for part in parts:
+                if part and part != '.':
+                    next_fd = os.open(part, flags, dir_fd=root_fd)
+                    directories.append((root_fd, part, next_fd))
+                    root_fd = next_fd
+        except BaseException:
+            for _, _, fd in reversed(directories):
+                os.close(fd)
+            raise
     except OSError as exc:
         raise ValueError('wiki directory unavailable') from exc
     article_fd = root_fd
@@ -42,44 +54,106 @@ def wiki_evidence(root, query=''):
                 article_fd = os.open('wiki', flags, dir_fd=root_fd)
             except OSError as exc:
                 raise ValueError('wiki article directory unavailable') from exc
+            directories.append((root_fd, 'wiki', article_fd))
             prefix = 'wiki/'
-        terms = set(re.findall(r'[^\W_]{3,}', query.casefold())) - {
+        def directories_current():
+            try:
+                for parent, name, fd in directories:
+                    opened = os.fstat(fd)
+                    current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    if not stat.S_ISDIR(current.st_mode) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                        return False
+                return True
+            except OSError:
+                return False
+        if not directories_current():
+            return []
+        deadline = time.monotonic() + 2
+        remaining = 4 * 1024 * 1024
+        identities = {}
+        def identity(s):
+            return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
+                    s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        def validate(result):
+            if not directories_current():
+                return []
+            try:
+                if not prefix:
+                    try:
+                        os.stat('wiki', dir_fd=root_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        return []
+                for path in {entry['path'] for entry in result}:
+                    current = os.stat(path[len(prefix):], dir_fd=article_fd, follow_symlinks=False)
+                    if identity(current) != identities[path]:
+                        return []
+            except OSError:
+                return []
+            return result
+        terms = set(re.findall(r'[^\W_]{3,}', query[:1048576].casefold())) - {
             'diff', 'git', 'index', 'the', 'and', 'for', 'from', 'with'}
         def read(name):
+            nonlocal remaining
             path = prefix + name
-            if not name.lower().endswith('.md') or len(path.encode('utf-8')) > 255:
-                return None
             try:
+                if not name.lower().endswith('.md') or len(path.encode('utf-8')) > 255:
+                    return []
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=article_fd)
                 try:
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
-                        return None
-                    with os.fdopen(fd, 'rb', closefd=False) as f:
-                        content = f.read(16_385)
-                    if len(content) > 16_384:
-                        return None
-                    return {'path': path, 'text': content.decode('utf-8')}
+                    before = os.fstat(fd)
+                    if not stat.S_ISREG(before.st_mode):
+                        return []
+                    limit = min(before.st_size, 256 * 1024, remaining)
+                    content = bytearray()
+                    while len(content) < limit and time.monotonic() < deadline:
+                        data = os.read(fd, min(16384, limit - len(content)))
+                        if not data:
+                            break
+                        content.extend(data)
+                        remaining -= len(data)
+                    after = os.fstat(fd)
+                    current = os.stat(name, dir_fd=article_fd, follow_symlinks=False)
+                    if identity(before) != identity(after) or identity(after) != identity(current) or len(content) != limit:
+                        return []
+                    decoder = codecs.getincrementaldecoder('utf-8')('strict')
+                    data = decoder.decode(content, final=limit == before.st_size).encode('utf-8')
+                    chunks = []
+                    while data:
+                        end = min(len(data), 16384)
+                        while end < len(data) and data[end] & 0xc0 == 0x80:
+                            end -= 1
+                        chunks.append({'path': path, 'text': data[:end].decode('utf-8')})
+                        data = data[end:]
+                    identities[path] = identity(after)
+                    return chunks or [{'path': path, 'text': ''}]
                 finally:
                     os.close(fd)
             except (OSError, UnicodeError):
-                return None
-        index = read('index.md')
+                return []
+        index_chunks = read('index.md')
+        index = index_chunks[:1]
         with os.scandir(article_fd) as entries:
-            names = sorted(entry.name for entry in itertools.islice(entries, 500))
+            names = [entry.name for entry in itertools.islice(entries, 501)]
+        # ponytail: reject overflow rather than select a filesystem-order subset.
+        if len(names) > 500:
+            return validate(index)
+        names.sort()
         candidates = []
         for name in names:
-            if name == 'index.md':
-                continue
-            entry = read(name)
-            if entry is not None:
+            if time.monotonic() >= deadline or remaining <= 0:
+                break
+            entries = index_chunks[1:] if name == 'index.md' else read(name)
+            for offset, entry in enumerate(entries):
                 words = set(re.findall(r'[^\W_]{3,}', (name + ' ' + entry['text']).casefold()))
-                candidates.append((len(terms & words), name, entry))
-        candidates.sort(key=lambda item: (-item[0], item[1]))
-        return ([index] if index else []) + [item[2] for item in candidates[:20 - bool(index)]]
+                candidates.append((len(terms & words), name, offset, entry))
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        # ponytail: checks cannot prevent changes after validation or ABA races.
+        return validate(index + [item[3] for item in candidates[:20 - len(index)]])
     finally:
-        if article_fd != root_fd:
-            os.close(article_fd)
-        os.close(root_fd)
+        for _, _, fd in reversed(directories):
+            os.close(fd)
 
 
 class Worker:
