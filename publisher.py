@@ -124,8 +124,9 @@ class GitHubPublisher:
             # A complete positive match is evidence of delivery; absence is not
             # evidence of non-delivery, even if every page was read successfully.
             try:
+                # ponytail: scan at most 10,000 reviews; larger histories need operator reconciliation.
                 for page in range(1, 1001):
-                    reviews = self.get(f'{endpoint}?per_page=100&page={page}')
+                    reviews = self.get(f'{endpoint}?per_page=10&page={page}')
                     if not isinstance(reviews, list):
                         return 'ambiguous'
                     for item in reviews:
@@ -135,7 +136,7 @@ class GitHubPublisher:
                             with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db, db:
                                 db.execute("UPDATE publications SET state = 'sent' WHERE key = ?", (key,))
                             return 'sent'
-                    if len(reviews) < 100:
+                    if len(reviews) < 10:
                         break
             except Exception:
                 pass

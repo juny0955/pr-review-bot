@@ -32,10 +32,15 @@ class TransportTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, '^GitHub transport failed$'):
                     publish_transport('fake-token', path, body)
             request.return_value = [{'body': 'review'}]
-            self.assertEqual(review_list_transport('fake-token', path + '?per_page=100&page=1'), request.return_value)
+            self.assertEqual(review_list_transport('fake-token', path + '?per_page=10&page=1'), request.return_value)
             with self.assertRaises(RuntimeError):
                 review_list_transport('fake-token', path + '?page=1')
             request.return_value = [None]
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=10&page=1')
+            request.return_value = [{}] * 11
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=10&page=1')
             with self.assertRaises(RuntimeError):
                 review_list_transport('fake-token', path + '?per_page=100&page=1')
 

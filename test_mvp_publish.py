@@ -19,7 +19,7 @@ HEAD, BASE = 'a' * 40, 'b' * 40
 class MVPTests(unittest.TestCase):
     @patch('revocation_gate._trusted_directory', side_effect=lambda path: os.open(path, os.O_RDONLY | os.O_DIRECTORY))
     def test_signed_approved_result_posts_once_and_rejects_tampering(self, _trusted):
-        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as root:
             gate = os.path.join(root, 'gate')
             os.mkdir(gate, 0o700)
             open(os.path.join(gate, 'lock'), 'w').close()

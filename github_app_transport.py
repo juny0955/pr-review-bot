@@ -10,11 +10,12 @@ import sys
 import time
 
 MAX_REQUEST = 1024 * 1024
-MAX_RESPONSE = 256 * 1024
+# ponytail: 4 MiB bounds all responses; oversized reviews remain ambiguous.
+MAX_RESPONSE = 4 * 1024 * 1024
 TIMEOUT = 15
 _TOKEN = re.compile(r'[\x21-\x7e]{1,4096}\Z')
 _PATH = re.compile(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*\Z')
-_REVIEWS = re.compile(r'(/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*/reviews)(?:\?per_page=100&page=([1-9][0-9]*))?\Z')
+_REVIEWS = re.compile(r'(/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*/reviews)(?:\?per_page=10&page=([1-9][0-9]*))?\Z')
 
 
 def _https(method, path, credential, body):
@@ -164,7 +165,7 @@ def review_list_transport(token, path):
             or any(part in ('.', '..') for part in path.split('/'))):
         raise RuntimeError('GitHub transport failed')
     result = _request('GET', path, token)
-    if not isinstance(result, list) or len(result) > 100 or any(not isinstance(item, dict) for item in result):
+    if not isinstance(result, list) or len(result) > 10 or any(not isinstance(item, dict) for item in result):
         raise RuntimeError('GitHub transport failed')
     return result
 

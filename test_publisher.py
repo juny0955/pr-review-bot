@@ -271,6 +271,34 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'sent')
             self.assertEqual(post.call_count, 1)
 
+    def test_reconcile_large_paginated_reviews_and_bound(self):
+        import json, tempfile
+        from pathlib import Path
+        from github_app_transport import MAX_RESPONSE, _https, review_list_transport
+
+        with tempfile.TemporaryDirectory() as directory:
+            post = Mock(side_effect=TimeoutError())
+            def request(method, path, token):
+                page = int(path.rsplit('=', 1)[1])
+                items = [{'commit_id': SHA, 'body': 'x' * 60000} for _ in range(10)]
+                if page == 2:
+                    items[0]['body'] = post.call_args.args[1]['body']
+                conn = Mock()
+                conn.getresponse.return_value.status = 200
+                conn.getresponse.return_value.read.return_value = json.dumps(items).encode()
+                with patch('github_app_transport.http.client.HTTPSConnection', return_value=conn):
+                    return json.loads(_https(method, path, token, None))
+            get = lambda path: review_list_transport('fake-token', '/' + path)
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=Path(directory) / 'ledger', get=get)
+            self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            with patch('github_app_transport._request', side_effect=request) as transport:
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'sent')
+                self.assertEqual(transport.call_count, 2)
+                self.assertIn('per_page=10&page=2', transport.call_args.args[1])
+            self.assertEqual(post.call_count, 1)
+            self.assertGreaterEqual(MAX_RESPONSE, 600000)
+
     def test_fails_closed_without_durable_ledger(self):
         post = Mock()
         publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True)
