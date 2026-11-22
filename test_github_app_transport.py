@@ -44,6 +44,37 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 review_list_transport('fake-token', path + '?per_page=100&page=1')
 
+    def test_inline_comment_validation_before_post(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review'}
+        comment = {'path': 'src/main.py', 'line': 1, 'side': 'RIGHT', 'body': 'fix this'}
+        response = {'id': 1, 'commit_id': body['commit_id'], 'body': body['body'], 'state': 'COMMENTED'}
+        invalid = [None, {}, 'comments', [comment] * 101]
+        invalid += [[{**comment, 'path': p}] for p in ('', '../x', '/x', 'a//b', 'a b', 1)]
+        invalid += [[{**comment, 'line': n}] for n in (True, 0, -1, 1.5, '1')]
+        invalid += [[{**comment, 'side': s}] for s in ('LEFT', '', None)]
+        invalid += [[{**comment, 'body': b}] for b in ('', '  ', None, 'x' * 65537, '\ud800')]
+        invalid += [[{}, {**comment, 'extra': 1}], [{k: v for k, v in comment.items() if k != 'side'}]]
+        with patch('github_app_transport._request', return_value=response) as request:
+            for comments in invalid:
+                with self.subTest(comments=str(comments)[:100]), self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', path, {**body, 'comments': comments})
+                request.assert_not_called()
+            for comments in ([], [comment], [comment] * 100):
+                self.assertEqual(publish_transport('fake-token', path, {**body, 'comments': comments}), response)
+            self.assertEqual(request.call_count, 3)
+
+    def test_inline_request_preserves_credential_and_size_guards(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        comment = {'path': 'a.py', 'line': 1, 'side': 'RIGHT', 'body': 'x' * 20000}
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review', 'comments': [comment]}
+        with patch('github_app_transport.subprocess.Popen') as popen:
+            for token, payload in [('bad\ntoken', body), ('fake-token', {**body, 'comments': [comment] * 100}),
+                                   ('fake-token', {**body, 'body': 'x' * (65536 + 129)})]:
+                with self.assertRaises(RuntimeError):
+                    publish_transport(token, path, payload)
+            popen.assert_not_called()
+
     def connection(self, status=201, data=b'{}'):
         response = Mock(status=status)
         response.read.return_value = data

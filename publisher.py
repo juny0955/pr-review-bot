@@ -56,6 +56,12 @@ def _guard_publish(publish_locked):
         if SECRET.search(review):
             raise ValueError('review contains a potential secret')
         body, comments = unpack_review(review)
+        try:
+            if (len(comments) > 100 or len(body.encode('utf-8')) > 65536
+                    or any(len(c['body'].encode('utf-8')) > 65536 for c in comments)):
+                raise ValueError('invalid review')
+        except UnicodeEncodeError:
+            raise ValueError('invalid review') from None
         if SECRET.search(body) or any(SECRET.search(c['body']) for c in comments):
             raise ValueError('review contains a potential secret')
         if not self.enabled:

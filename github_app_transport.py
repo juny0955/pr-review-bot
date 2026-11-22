@@ -173,12 +173,21 @@ def review_list_transport(token, path):
 def publish_transport(token, path, body):
     match = _REVIEWS.fullmatch(path) if isinstance(path, str) else None
     if (not match or match.group(2) or any(part in ('.', '..') for part in path.split('/'))
-            or not isinstance(body, dict) or set(body) != {'commit_id', 'event', 'body'}
+            or not isinstance(body, dict) or set(body) not in ({'commit_id', 'event', 'body'}, {'commit_id', 'event', 'body', 'comments'})
             or body['event'] != 'COMMENT' or not isinstance(body['commit_id'], str)
             or not re.fullmatch(r'[0-9a-f]{40}', body['commit_id'])
             or not isinstance(body['body'], str) or not body['body'].strip()):
         raise RuntimeError('GitHub transport failed')
     try:
+        from inline_review import PATH
+        comments = body.get('comments', [])
+        if (type(comments) is not list or len(comments) > 100 or any(
+                type(c) is not dict or set(c) != {'path', 'line', 'side', 'body'}
+                or not isinstance(c['path'], str) or not PATH.fullmatch(c['path'])
+                or type(c['line']) is not int or c['line'] <= 0 or c['side'] != 'RIGHT'
+                or not isinstance(c['body'], str) or not c['body'].strip()
+                or len(c['body'].encode('utf-8')) > 65536 for c in comments)):
+            raise ValueError('invalid comments')
         if len(body['body'].encode('utf-8')) > 65536 + 128:
             raise ValueError('body too large')
         result = _request('POST', path, token, body)

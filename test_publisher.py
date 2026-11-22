@@ -148,6 +148,42 @@ class LedgerTests(unittest.TestCase):
         gate = patch('publisher._require_revocation_gate')
         gate.start()
         self.addCleanup(gate.stop)
+    def test_inline_review_reaches_mock_github_and_prior_ambiguous_never_reposts(self):
+        from contextlib import closing
+        import json, sqlite3, tempfile
+        from pathlib import Path
+        from github_app_transport import publish_transport, _https
+        from inline_review import prepare_review
+
+        diff = 'diff --git a/src.py b/src.py\n--- a/src.py\n+++ b/src.py\n@@ -1 +1 @@\n-old\n+new\n'
+        review = prepare_review(json.dumps({'body': 'summary', 'comments': [
+            {'path': 'src.py', 'line': 1, 'body': 'fix this'}]}), diff)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ledger'
+            conn = Mock()
+            def accept(method, endpoint, **kwargs):
+                payload = json.loads(kwargs['body'])
+                self.assertEqual(method, 'POST')
+                self.assertEqual(endpoint, '/repos/example-owner/example-repo/pulls/7/reviews')
+                self.assertEqual(payload['comments'], [{'path': 'src.py', 'line': 1, 'side': 'RIGHT', 'body': 'fix this'}])
+                conn.getresponse.return_value.status = 200
+                conn.getresponse.return_value.read.return_value = json.dumps(
+                    {'id': 1, 'commit_id': payload['commit_id'], 'body': payload['body'], 'state': 'COMMENTED'}).encode()
+            conn.request.side_effect = accept
+            def request(method, endpoint, token, body):
+                return json.loads(_https(method, endpoint, token, json.dumps(body)))
+            post = Mock(side_effect=lambda endpoint, payload: publish_transport('fake-token', '/' + endpoint, payload))
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=path, get=Mock(return_value=[]), diff=Mock(return_value=diff))
+            with patch('github_app_transport._request', side_effect=request), patch('github_app_transport.http.client.HTTPSConnection', return_value=conn):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'sent')
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'sent')
+                self.assertEqual(conn.request.call_count, 1)
+                with closing(sqlite3.connect(path)) as db, db:
+                    db.execute("UPDATE publications SET state = 'ambiguous' WHERE marker LIKE '<!--%'")
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'ambiguous')
+                self.assertEqual(conn.request.call_count, 1)
+
     def test_new_claim_blocks_legacy_claim_before_post(self):
         from contextlib import closing
         import hashlib, json, sqlite3, tempfile
