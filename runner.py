@@ -37,6 +37,8 @@ def main(argv=None):
     if not (args.dry_run and args.enable_direct_inference and args.authorize_wiki_transfer):
         parser.error('requires --dry-run, --enable-direct-inference and --authorize-wiki-transfer')
     try:
+        if not os.environ.get('WEBHOOK_SECRET'):
+            raise ValueError('webhook secret required')
         require_app_read_flag(args.github_app_read)
         if Path(args.db).is_symlink() or not Path(args.db).is_file():
             raise ValueError('existing queue database required')

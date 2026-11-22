@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_worker import FakeGH, FakeModel, payload
+from test_worker import FakeGH, FakeModel, payload, sign_queue
 from worker import Worker, mode_provenance
 
 SECRET = 'synthetic-test-secret'
@@ -91,12 +91,12 @@ class OutboxTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / 'queue'
             policy = {123: 'example-owner/example-repo'}
-            server = create_server('secret', policy, db, port=0)
+            server = create_server(SECRET, policy, db, port=0)
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
             try:
                 body = json.dumps(payload()).encode()
-                headers = {'X-Hub-Signature-256': 'sha256=' + hmac.new(b'secret', body, hashlib.sha256).hexdigest(),
+                headers = {'X-Hub-Signature-256': 'sha256=' + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest(),
                            'X-GitHub-Event': 'pull_request', 'X-GitHub-Delivery': 'one'}
                 conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
                 conn.request('POST', '/webhook', body, headers)
@@ -227,6 +227,7 @@ class OutboxTest(unittest.TestCase):
             worker = Worker(db, FakeGH(), FakeModel(), root, {123: 'example-owner/example-repo'}, clock=lambda: now[0], webhook_secret=SECRET)
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', SECRET)
                 conn.execute("UPDATE outbox SET repo_id=123,repo_name='example-owner/example-repo',pr_number=1 WHERE delivery_id='one'")
             self.assertEqual(worker.run_once()['status'], 'done')
             with closing(sqlite3.connect(db)) as conn, conn:
@@ -269,6 +270,7 @@ class OutboxTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', SECRET)
             now = [1000]
             class Broken:
                 def current(self, *args):

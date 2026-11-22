@@ -7,10 +7,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_worker import FakeGH, FakeModel, payload
+from test_worker import FakeGH, FakeModel, payload, sign_queue
 
 
+@patch.dict('os.environ', {'WEBHOOK_SECRET': 'synthetic'})
 class RunnerTest(unittest.TestCase):
+    def test_missing_secret_first_claim_is_rejected_in_real_entrypoints(self):
+        import runner
+        import orchestrator
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'queue'
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
+                conn.execute('INSERT INTO queue VALUES (?,?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', 'synthetic')
+            args = ['--db', str(db), '--wiki', directory, '--repos', 'fake',
+                    '--dry-run', '--enable-direct-inference', '--authorize-wiki-transfer']
+            for module in (runner, orchestrator):
+                output = io.StringIO()
+                with patch.dict('os.environ', {}, clear=True), patch.object(module, 'allowed', return_value={123: 'example-owner/example-repo'}), \
+                     patch.object(module, 'GitHubReadOnly', return_value=FakeGH()), \
+                     patch.object(module, 'resolve_hermes_direct_adapter', return_value=FakeModel()), \
+                     redirect_stdout(output):
+                    self.assertEqual(module.main(args), 1)
+                self.assertEqual(json.loads(output.getvalue()), {'status': 'error'})
+                with closing(sqlite3.connect(db)) as conn:
+                    self.assertEqual(conn.execute("SELECT count(*) FROM sqlite_master WHERE name='work'").fetchone()[0], 0)
+
     def test_retry_uses_configured_secret_and_holds_without_it(self):
         from runner import run_once
         with tempfile.TemporaryDirectory() as directory:
@@ -18,6 +41,7 @@ class RunnerTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                 conn.execute('INSERT INTO queue VALUES (?,?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', 'synthetic')
             class Broken:
                 def current(self, *args):
                     raise ValueError('synthetic failure')
@@ -27,7 +51,8 @@ class RunnerTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('UPDATE work SET next_attempt_at=0')
             with patch.dict('os.environ', {}, clear=True):
-                self.assertIsNone(run_once(*args, github=FakeGH(), model=FakeModel()))
+                with self.assertRaisesRegex(ValueError, 'webhook secret required'):
+                    run_once(*args, github=FakeGH(), model=FakeModel())
             with patch.dict('os.environ', {'WEBHOOK_SECRET': 'synthetic'}, clear=True):
                 self.assertEqual(run_once(*args, github=FakeGH(), model=FakeModel())['status'], 'done')
 
@@ -39,6 +64,7 @@ class RunnerTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', 'synthetic')
             wiki = root / 'wiki'
             wiki.mkdir()
             (wiki / 'index.md').write_text('fixture evidence')
@@ -111,6 +137,7 @@ class RunnerTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('one', json.dumps(payload()).encode()))
+                sign_queue(conn, 'one', 'synthetic')
             output = io.StringIO()
             with patch('runner.GitHubReadOnly', return_value=FakeGH()), patch('runner.resolve_hermes_direct_adapter', return_value=FakeModel()), redirect_stdout(output):
                 code = main(['--db', str(db), '--wiki', str(wiki), '--repos', str(repos), '--dry-run', '--enable-direct-inference', '--authorize-wiki-transfer'])
@@ -156,7 +183,7 @@ class RunnerTest(unittest.TestCase):
                 with self.subTest(module=module.__name__), patch.object(module, 'allowed'), \
                      patch.object(module, 'GitHubReadOnly'), patch.object(module, 'Worker') as worker, \
                      patch('orchestrator.DiscordTransport'), patch('orchestrator.DiscordNotifier'), \
-                     patch.dict('os.environ', {'DISCORD_CHANNEL_ID': '123'}, clear=True), \
+                     patch.dict('os.environ', {'DISCORD_CHANNEL_ID': '123', 'WEBHOOK_SECRET': 'synthetic'}, clear=True), \
                      patch('orchestrator.threading.Thread') as thread, redirect_stdout(output):
                     extra = ['--enable-discord-notifications'] if module is orchestrator else []
                     self.assertEqual(module.main(args + extra), 1)

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import orchestrator
 import runner
-from test_worker import FakeModel, payload
+from test_worker import FakeModel, payload, sign_queue
 
 
 class AppCLITest(unittest.TestCase):
@@ -25,6 +25,7 @@ class AppCLITest(unittest.TestCase):
                     with closing(sqlite3.connect(db)) as conn, conn:
                         conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                         conn.execute('INSERT INTO queue VALUES (?, ?)', ('id', json.dumps(payload()).encode()))
+                        sign_queue(conn, 'id', 'synthetic')
                     args = ['--db', str(db), '--wiki', str(wiki), '--repos', str(repos), '--dry-run',
                             '--enable-direct-inference', '--authorize-wiki-transfer', '--github-app-read']
                     env = {'GITHUB_APP_ID': '1234', 'GITHUB_APP_INSTALLATION_ID': '5678', 'GITHUB_APP_KEY_PATH': '/synthetic/key'}
@@ -34,7 +35,7 @@ class AppCLITest(unittest.TestCase):
                     output, errors = io.StringIO(), io.StringIO()
                     def run_one(worker, stop):
                         worker.run_once()
-                    with patch.dict('os.environ', env, clear=True), \
+                    with patch.dict('os.environ', dict(env, WEBHOOK_SECRET='synthetic'), clear=True), \
                          patch('github_app_auth.InstallationAuth._token', side_effect=RuntimeError('SYNTHETIC_SECRET') if failure else None, return_value=('fake-token', 1)) as token, \
                          patch('github_adapter.read_transport', return_value=response) as read, \
                          patch('github_adapter._pinned_diff', return_value='synthetic diff') as diff, \
@@ -91,7 +92,7 @@ class AppCLITest(unittest.TestCase):
                 db.touch()
                 args = ['--db', str(db), '--wiki', 'fake', '--repos', 'fake', '--dry-run',
                         '--enable-direct-inference', '--authorize-wiki-transfer']
-                with patch.dict('os.environ', {}, clear=True), patch.object(module, 'allowed'), \
+                with patch.dict('os.environ', {'WEBHOOK_SECRET': 'synthetic'}, clear=True), patch.object(module, 'allowed'), \
                      patch.object(module, 'GitHubReadOnly') as github, patch.object(module, 'Worker'), \
                      patch.object(module, 'resolve_hermes_direct_adapter'), \
                      patch.object(runner, 'run_once', return_value=None), \

@@ -148,7 +148,7 @@ class SecurityTest(unittest.TestCase):
     def test_old_done_result_is_not_evicted_even_after_notifications_sent(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -186,7 +186,7 @@ class SecurityTest(unittest.TestCase):
     def test_cleanup_preserves_every_unsent_outbox_source(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         assert claim is not None
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
@@ -211,7 +211,7 @@ class SecurityTest(unittest.TestCase):
     def test_cleanup_preserves_unresolved_outbox_source(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         assert claim is not None
         self.assertTrue(worker.finish(claim[0], claim[2], 'done', {'status': 'done'}))
@@ -231,7 +231,7 @@ class SecurityTest(unittest.TestCase):
                                pull_request={'number': 1 if status != 'skipped' else 2, 'draft': False, 'state': 'open', 'head': {'sha': 'a' * 40}})
                 delivery = status
                 self.assertEqual(self.send(body, {'X-GitHub-Delivery': delivery}), 202)
-                worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+                worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
                 claim = worker.claim()
                 self.assertTrue(worker.finish(claim[0], claim[2], status, {'status': status}))
                 with patch('receiver.MAX_QUEUE', 1):
@@ -243,7 +243,7 @@ class SecurityTest(unittest.TestCase):
     def test_insert_integrity_error_rolls_back_transaction(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -264,7 +264,7 @@ class SecurityTest(unittest.TestCase):
         from worker import Worker
         from receiver import create_server
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         self.assertTrue(worker.finish(claim[0], claim[2], 'failed', {'status': 'failed'}))
         with closing(sqlite3.connect(self.db)) as db, db:
@@ -285,7 +285,7 @@ class SecurityTest(unittest.TestCase):
     def test_full_queue_never_evicts_running_or_retry_work(self):
         from worker import Worker
         self.assertEqual(self.send(), 202)
-        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'})
+        worker = Worker(self.db, None, None, '.', {123: 'acme/repo'}, webhook_secret='secret')
         claim = worker.claim()
         with patch('receiver.MAX_QUEUE', 1):
             self.assertEqual(self.send(payload(action='reopened'), {'X-GitHub-Delivery': 'new'}), 503)

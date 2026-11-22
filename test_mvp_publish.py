@@ -149,11 +149,11 @@ class MVPTests(unittest.TestCase):
                       'sha': HEAD, 'base_sha': BASE, 'review': review}
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT, body BLOB)')
-                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT)')
+                conn.execute('CREATE TABLE work (delivery_id TEXT, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT, result_provenance TEXT)')
                 conn.execute('CREATE TABLE webhook_signatures (delivery_id TEXT, signature TEXT)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('delivery', body))
-                from worker import mode_provenance
-                conn.execute('INSERT INTO work VALUES (?, ?, ?, ?, ?, ?)', ('delivery', 'done', json.dumps(result), 1, 1, mode_provenance('test-secret', 'delivery', body, 1, 1)))
+                from worker import mode_provenance, result_provenance
+                conn.execute('INSERT INTO work VALUES (?, ?, ?, ?, ?, ?, ?)', ('delivery', 'done', json.dumps(result), 1, 1, mode_provenance('test-secret', 'delivery', body, 1, 1), result_provenance('test-secret', 'delivery', body, 1, 1, json.dumps(result))))
                 conn.execute('INSERT INTO webhook_signatures VALUES (?, ?)', ('delivery', 'sha256=' + hmac.new(b'test-secret', body, hashlib.sha256).hexdigest()))
             github = Mock()
             github.current.return_value = {'repo_id': 123, 'repo': REPO, 'state': 'open', 'draft': False, 'sha': HEAD, 'base_sha': BASE}

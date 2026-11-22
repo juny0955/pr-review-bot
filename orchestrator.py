@@ -153,6 +153,8 @@ def main(argv=None):
     if args.single_vps_publish and not (args.github_app_read and args.publication_ledger and args.publication_gate and os.environ.get('WEBHOOK_SECRET')):
         parser.error('publication configuration incomplete')
     try:
+        if not os.environ.get('WEBHOOK_SECRET'):
+            raise ValueError('webhook secret required')
         require_app_read_flag(args.github_app_read)
         db = Path(args.db)
         if db.is_symlink() or not db.is_file():

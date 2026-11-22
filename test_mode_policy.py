@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 
 from orchestrator import publication_loop
 from retention import cleanup_done
-from worker import Worker, mode_provenance
+from worker import Worker, mode_provenance, result_provenance
+from test_worker import sign_queue
 
 
 class ModePolicyTest(unittest.TestCase):
@@ -20,6 +21,7 @@ class ModePolicyTest(unittest.TestCase):
             with closing(sqlite3.connect(db)) as c, c:
                 c.execute('CREATE TABLE queue(delivery_id TEXT PRIMARY KEY, body BLOB)')
                 c.execute("INSERT INTO queue VALUES('id', X'7b7d')")
+                sign_queue(c, 'id', 'fake')
             dry = Worker(db, Mock(), Mock(), d, {1: 'a/b'}, clock=lambda: 100, publish_eligible=False, notifications_enabled=False, webhook_secret='fake')
             delivery, _, token = dry.claim()
             dry.finish(delivery, token, 'retry', {'status': 'retry'})
@@ -54,6 +56,8 @@ class ModePolicyTest(unittest.TestCase):
                 c.executescript('CREATE TABLE queue(delivery_id TEXT PRIMARY KEY,body BLOB); CREATE TABLE work(delivery_id TEXT PRIMARY KEY,status TEXT,completed_at REAL,result TEXT,publish_eligible INTEGER,notifications_enabled INTEGER,mode_provenance TEXT); CREATE TABLE outbox(delivery_id TEXT,event TEXT,status TEXT,repo_id INTEGER,repo_name TEXT,pr_number INTEGER); CREATE TABLE webhook_signatures(delivery_id TEXT,signature TEXT); CREATE TABLE tombstone(delivery_id TEXT PRIMARY KEY,body_hash BLOB);')
                 c.execute('INSERT INTO queue VALUES (?,?)', ('id', body))
                 c.execute('INSERT INTO work VALUES (?,?,?,?,?,?,?)', ('id','done',0,json.dumps(result),0,0,mode_provenance('secret','id',body,0,0)))
+                c.execute('ALTER TABLE work ADD COLUMN result_provenance TEXT')
+                c.execute('UPDATE work SET result_provenance=?', (result_provenance('secret','id',body,0,0,json.dumps(result)),))
                 c.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('id','sha256='+hmac.new(b'secret',body,hashlib.sha256).hexdigest()))
                 c.executemany('INSERT INTO outbox VALUES (?,?,?,?,?,?)', [('id', x, 'suppressed', None, None, None) for x in ('detected','started','completed')])
             with closing(sqlite3.connect(ledger)) as c, c:

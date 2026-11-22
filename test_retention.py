@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from retention import cleanup_done
-from worker import mode_provenance
+from worker import mode_provenance, result_provenance
 
 
 class RetentionTest(unittest.TestCase):
@@ -24,6 +24,8 @@ class RetentionTest(unittest.TestCase):
                 db.executescript('CREATE TABLE queue(delivery_id TEXT PRIMARY KEY,body BLOB); CREATE TABLE work(delivery_id TEXT PRIMARY KEY,status TEXT,completed_at REAL,result TEXT,publish_eligible INTEGER,notifications_enabled INTEGER,mode_provenance TEXT); CREATE TABLE outbox(delivery_id TEXT,event TEXT,status TEXT,repo_id INTEGER,repo_name TEXT,pr_number INTEGER); CREATE TABLE webhook_signatures(delivery_id TEXT,signature TEXT); CREATE TABLE tombstone(delivery_id TEXT PRIMARY KEY,body_hash BLOB);')
                 db.execute('INSERT INTO queue VALUES (?,?)', ('id', body))
                 db.execute('INSERT INTO work VALUES (?,?,?,?,?,?,?)', ('id', 'done', 0, json.dumps(result), 0, 0, mode_provenance('secret', 'id', body, 1, 0)))
+                db.execute('ALTER TABLE work ADD COLUMN result_provenance TEXT')
+                db.execute('UPDATE work SET result_provenance=?', (result_provenance('secret', 'id', body, 1, 1, json.dumps(result)),))
                 db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('id', 'sha256=' + hmac.new(b'secret', body, hashlib.sha256).hexdigest()))
                 db.executemany('INSERT INTO outbox VALUES (?,?,?,?,?,?)', [('id', name, 'suppressed', None, None, None) for name in ('detected', 'started', 'completed')])
             with closing(sqlite3.connect(ledger)) as db, db:
@@ -40,7 +42,7 @@ class RetentionTest(unittest.TestCase):
             self.assertFalse(cleanup_done(queue, ledger, 'id', 'secret'))
             with closing(sqlite3.connect(queue)) as db, db:
                 db.execute('UPDATE work SET publish_eligible=0,notifications_enabled=0')
-                db.execute('UPDATE work SET mode_provenance=?', (mode_provenance('secret', 'id', body, 0, 0),))
+                db.execute('UPDATE work SET mode_provenance=?,result_provenance=?', (mode_provenance('secret', 'id', body, 0, 0), result_provenance('secret', 'id', body, 0, 0, json.dumps(result))))
             self.assertTrue(cleanup_done(queue, ledger, 'id', 'secret'))
 
     def test_only_verified_old_sent_result_is_removed(self):
@@ -60,6 +62,8 @@ class RetentionTest(unittest.TestCase):
                 db.execute('ALTER TABLE work ADD COLUMN notifications_enabled INTEGER')
                 db.execute('ALTER TABLE work ADD COLUMN mode_provenance TEXT')
                 db.execute('UPDATE work SET publish_eligible=1, notifications_enabled=1, mode_provenance=?', (mode_provenance('secret', 'id', body, 1, 1),))
+                db.execute('ALTER TABLE work ADD COLUMN result_provenance TEXT')
+                db.execute('UPDATE work SET result_provenance=?', (result_provenance('secret', 'id', body, 1, 1, json.dumps(result)),))
                 db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('id', 'sha256=' + hmac.new(b'secret', body, hashlib.sha256).hexdigest()))
                 db.executemany('INSERT INTO outbox VALUES (?,?,?,?,?,?)',
                                [('id', name, 'sent', 1, 'a/b', 2) for name in ('detected', 'started', 'completed')])

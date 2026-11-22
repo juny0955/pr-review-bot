@@ -173,6 +173,22 @@ def valid_mode(secret, delivery, body, publish, notifications, provenance):
                 and hmac.compare_digest(provenance, expected))
 
 
+def result_provenance(secret, delivery, body, publish, notifications, result):
+    import hashlib
+    import hmac
+    if not mode_provenance(secret, delivery, body, publish, notifications) or not isinstance(result, str):
+        return None
+    payload = json.dumps(['result-v1', delivery, hashlib.sha256(body).hexdigest(), publish, notifications, result], ensure_ascii=True, separators=(',', ':')).encode()
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def valid_result(secret, delivery, body, publish, notifications, result, provenance):
+    import hmac
+    expected = result_provenance(secret, delivery, body, publish, notifications, result)
+    return bool(expected and isinstance(provenance, str) and re.fullmatch(r'[0-9a-f]{64}', provenance)
+                and hmac.compare_digest(provenance, expected))
+
+
 class Worker:
     def __init__(self, db_path, github, model, wiki, repos, lease_seconds=300, clock=time.time,
                  *, publish_eligible=False, notifications_enabled=True, webhook_secret=None):
@@ -205,13 +221,26 @@ class Worker:
                     db.execute(f'ALTER TABLE work ADD COLUMN {column} INTEGER')
             if 'mode_provenance' not in columns:
                 db.execute('ALTER TABLE work ADD COLUMN mode_provenance TEXT')
+            if 'result_provenance' not in columns:
+                db.execute('ALTER TABLE work ADD COLUMN result_provenance TEXT')
             Outbox.install_work_triggers(db)
 
     def claim(self):
+        if not isinstance(self.webhook_secret, str) or not self.webhook_secret:
+            raise ValueError('webhook secret required')
         token = uuid.uuid4().hex
         with closing(sqlite3.connect(self.db_path, timeout=5)) as db, db:
             db.execute('BEGIN IMMEDIATE')
             now = self.clock()
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='webhook_signatures'").fetchone():
+                return None
+            import hashlib
+            import hmac
+            def valid_signature(body, signature):
+                return bool(isinstance(body, bytes) and isinstance(signature, str)
+                            and re.fullmatch(r'sha256=[0-9a-f]{64}', signature)
+                            and hmac.compare_digest(signature, 'sha256=' + hmac.new(self.webhook_secret.encode(), body, hashlib.sha256).hexdigest()))
+            db.create_function('valid_signature', 2, valid_signature)
             # A crashed final attempt must also become terminal; do not reclaim it.
             db.create_function('valid_mode', 5, lambda delivery, body, publish, notifications, mac:
                                valid_mode(self.webhook_secret, delivery, body, publish, notifications, mac))
@@ -228,12 +257,15 @@ class Worker:
                 (json.dumps({'status': 'retry', 'reason': 'processing failed'}), now))
             row = db.execute('''SELECT q.delivery_id, q.body FROM queue q
                 LEFT JOIN work w ON w.delivery_id=q.delivery_id
-                WHERE w.delivery_id IS NULL OR (w.status='retry' AND COALESCE(w.next_attempt_at, 0) <= ?
-                    AND w.publish_eligible=? AND w.notifications_enabled=? AND valid_mode(w.delivery_id,q.body,w.publish_eligible,w.notifications_enabled,w.mode_provenance))
+                WHERE EXISTS (SELECT 1 FROM webhook_signatures s WHERE s.delivery_id=q.delivery_id AND valid_signature(q.body,s.signature))
+                AND (w.delivery_id IS NULL OR (w.status='retry' AND COALESCE(w.next_attempt_at, 0) <= ?
+                    AND w.publish_eligible=? AND w.notifications_enabled=? AND valid_mode(w.delivery_id,q.body,w.publish_eligible,w.notifications_enabled,w.mode_provenance)))
                 ORDER BY q.rowid LIMIT 1''', (now, int(self.publish_eligible), int(self.notifications_enabled))).fetchone()
             if row is None:
                 return None
             provenance = mode_provenance(self.webhook_secret, row[0], row[1], int(self.publish_eligible), int(self.notifications_enabled))
+            if not provenance:
+                raise ValueError('invalid mode provenance')
             db.execute('''INSERT INTO work(delivery_id,status,lease_token,lease_until,attempts,publish_eligible,notifications_enabled,mode_provenance)
                 VALUES (?,'running',?,?,1,?,?,?)
                 ON CONFLICT(delivery_id) DO UPDATE SET status='running',
@@ -248,9 +280,11 @@ class Worker:
         with closing(sqlite3.connect(self.db_path, timeout=5)) as db, db:
             db.execute('BEGIN IMMEDIATE')
             now = self.clock()
-            row = db.execute('''SELECT attempts FROM work WHERE delivery_id=? AND status='running'
+            row = db.execute('''SELECT w.attempts,q.body,w.publish_eligible,w.notifications_enabled,w.mode_provenance FROM work w JOIN queue q ON q.delivery_id=w.delivery_id WHERE w.delivery_id=? AND w.status='running'
                 AND lease_token=? AND lease_until > ?''', (delivery, token, now)).fetchone()
             if row is None:
+                return False
+            if not valid_mode(self.webhook_secret, delivery, row[1], row[2], row[3], row[4]):
                 return False
             next_attempt = None
             if status == 'retry':
@@ -259,9 +293,11 @@ class Worker:
                     result['status'] = 'failed'
                 else:
                     next_attempt = now + 30 * (2 ** (row[0] - 1))
-            db.execute('''UPDATE work SET status=?,result=?,lease_token=NULL,lease_until=NULL,
+            serialized = json.dumps(result, ensure_ascii=True)
+            mac = result_provenance(self.webhook_secret, delivery, row[1], row[2], row[3], serialized) if status == 'done' else None
+            db.execute('''UPDATE work SET status=?,result=?,result_provenance=?,lease_token=NULL,lease_until=NULL,
                 next_attempt_at=?, completed_at=? WHERE delivery_id=?''',
-                (status, json.dumps(result, ensure_ascii=True), next_attempt,
+                (status, serialized, mac, next_attempt,
                  now if status in ('done', 'skipped', 'failed') else None, delivery))
             if not self.notifications_enabled:
                 db.execute("UPDATE outbox SET status='suppressed' WHERE delivery_id=? AND status='pending'", (delivery,))

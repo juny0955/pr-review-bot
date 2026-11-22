@@ -71,16 +71,17 @@ class OrchestratorTests(unittest.TestCase):
         from notification import DiscordNotifier
         from orchestrator import run_loop
         from worker import Worker
-        from test_worker import FakeGH, FakeModel, payload
+        from test_worker import FakeGH, FakeModel, payload, sign_queue
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             db = root / 'queue.db'
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
                 conn.execute('INSERT INTO queue VALUES (?, ?)', ('id', json.dumps(payload()).encode()))
+                sign_queue(conn, 'id', 'secret')
             wiki = root / 'wiki'
             wiki.mkdir()
-            worker = Worker(str(db), FakeGH(), FakeModel(), wiki, {123: 'example-owner/example-repo'})
+            worker = Worker(str(db), FakeGH(), FakeModel(), wiki, {123: 'example-owner/example-repo'}, webhook_secret='secret')
             send = Mock()
             notifier = DiscordNotifier(['123'], send, enabled=True)
             stop = Mock()

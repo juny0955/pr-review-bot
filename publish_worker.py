@@ -11,7 +11,7 @@ import hmac
 import sqlite3
 
 from publisher import GitHubPublisher
-from worker import ACTIONS, mode_provenance
+from worker import ACTIONS, mode_provenance, valid_result
 
 
 def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=None,
@@ -26,7 +26,7 @@ def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=Non
         if enabled:
             try:
                 signature = db.execute('SELECT signature FROM webhook_signatures WHERE delivery_id=?', (delivery_id,)).fetchone()
-                mode = db.execute('SELECT publish_eligible,notifications_enabled,mode_provenance FROM work WHERE delivery_id=?', (delivery_id,)).fetchone()
+                mode = db.execute('SELECT publish_eligible,notifications_enabled,mode_provenance,result_provenance FROM work WHERE delivery_id=?', (delivery_id,)).fetchone()
             except sqlite3.Error:
                 raise ValueError('signed webhook unavailable') from None
             if (not row or not signature or not isinstance(webhook_secret, str) or not webhook_secret
@@ -36,6 +36,8 @@ def publish_worker_result(db_path, delivery_id, *, post, current, repos, get=Non
             expected = mode_provenance(webhook_secret, delivery_id, row[0], mode[0], mode[1]) if mode else None
             if not mode or mode[0] != 1 or not expected or not isinstance(mode[2], str) or not hmac.compare_digest(mode[2], expected):
                 raise ValueError('invalid mode provenance')
+            if not valid_result(webhook_secret, delivery_id, row[0], mode[0], mode[1], row[1], mode[3]):
+                raise ValueError('invalid result provenance')
     if row is None:
         raise ValueError('completed worker result unavailable')
     try:

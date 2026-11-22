@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from publish_worker import publish_worker_result
-from worker import mode_provenance
+from worker import mode_provenance, result_provenance
 
 REPO, HEAD, BASE = 'owner/repo', 'a' * 40, 'b' * 40
 EVENT = {'repository': {'id': 1, 'full_name': REPO}, 'number': 7,
@@ -63,12 +63,12 @@ class PublishWorkerTests(unittest.TestCase):
         self.ledger = str(Path(self.tmp.name) / 'ledger')
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('CREATE TABLE queue (delivery_id TEXT PRIMARY KEY, body BLOB)')
-            db.execute('CREATE TABLE work (delivery_id TEXT PRIMARY KEY, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT)')
+            db.execute('CREATE TABLE work (delivery_id TEXT PRIMARY KEY, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT, result_provenance TEXT)')
             db.execute('CREATE TABLE webhook_signatures (delivery_id TEXT, signature TEXT)')
             body = json.dumps(EVENT).encode()
             db.execute('INSERT INTO queue VALUES (?,?)', ('id', body))
             db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('id', 'sha256=' + hmac.new(b'synthetic', body, hashlib.sha256).hexdigest()))
-            db.execute('INSERT INTO work VALUES (?,?,?,?,?,?)', ('id', 'done', json.dumps(RESULT), 1, 1, mode_provenance('synthetic', 'id', body, 1, 1)))
+            db.execute('INSERT INTO work VALUES (?,?,?,?,?,?,?)', ('id', 'done', json.dumps(RESULT), 1, 1, mode_provenance('synthetic', 'id', body, 1, 1), result_provenance('synthetic', 'id', body, 1, 1, json.dumps(RESULT))))
         self.post = Mock()
         self.current = Mock(return_value={'repo_id': 1, 'repo': REPO, 'state': 'open',
                                           'draft': False, 'sha': HEAD, 'base_sha': BASE})

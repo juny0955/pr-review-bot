@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from contextlib import closing, nullcontext
 
-from worker import Worker, mode_provenance
+from worker import Worker, mode_provenance, result_provenance
 from outbox import Outbox
 from publish_worker import publish_worker_result
 from retention import cleanup_done
@@ -25,6 +25,11 @@ class ModeSecurity(unittest.TestCase):
                      ('fake', 'd', b'body', 0, 0), ('fake', 'd', b'body', 1, 1),
                      ('other', 'd', b'body', 1, 0)]:
             self.assertNotEqual(mac, mode_provenance(*args))
+        mac = result_provenance('fake', 'd', b'body', 1, 0, 'review')
+        for args in [('other', 'd', b'body', 1, 0, 'review'), ('fake', 'e', b'body', 1, 0, 'review'),
+                     ('fake', 'd', b'other', 1, 0, 'review'), ('fake', 'd', b'body', 0, 0, 'review'),
+                     ('fake', 'd', b'body', 1, 1, 'review'), ('fake', 'd', b'body', 1, 0, 'changed')]:
+            self.assertNotEqual(mac, result_provenance(*args))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -65,6 +70,7 @@ class ModeSecurity(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as c, c:
             c.execute("INSERT INTO work(delivery_id,status,attempts,next_attempt_at,publish_eligible,notifications_enabled) VALUES ('d','retry',1,0,0,1)")
             c.execute('INSERT INTO queue VALUES (?,?)', ('e', self.body))
+            c.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('e', 'sha256=' + hmac.new(b'fake', self.body, hashlib.sha256).hexdigest()))
             c.execute("INSERT INTO work(delivery_id,status,attempts,next_attempt_at,publish_eligible,notifications_enabled,mode_provenance) VALUES ('e','retry',1,0,0,1,?)", (mode_provenance('fake', 'e', self.body, 0, 1),))
         self.assertEqual(w.claim()[0], 'e')
 
@@ -121,6 +127,32 @@ class ModeSecurity(unittest.TestCase):
         with patch('publisher._require_revocation_gate', return_value=nullcontext()):
             self.assertEqual(self.publish(), 'sent')
         self.post.assert_called_once()
+
+    def test_result_tampering_and_legacy_never_publish_or_cleanup(self):
+        self.post = Mock()
+        w = self.worker(live=True)
+        _, _, token = w.claim()
+        self.assertTrue(w.finish('d', token, 'done', RESULT))
+        with closing(sqlite3.connect(self.db)) as c, c:
+            original, mac = c.execute('SELECT result,result_provenance FROM work').fetchone()
+            c.execute('UPDATE work SET completed_at=0')
+            c.execute("UPDATE outbox SET status='suppressed'")
+        key = hashlib.sha256(json.dumps(['v2', 123, R, 7, H, B, 'synthetic'], ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+        with closing(sqlite3.connect(self.ledger)) as c, c:
+            c.execute('CREATE TABLE publications(key TEXT PRIMARY KEY,marker TEXT,state TEXT)')
+            c.execute('INSERT INTO publications VALUES (?,?,?)', (key, 'marker', 'sent'))
+        for result, signature in [(json.dumps(dict(RESULT, review='changed')), mac),
+                                  (json.dumps(dict(RESULT, base_sha='c'*40)), mac),
+                                  (original, None), (original, 'é'*64), (original, '0'*64)]:
+            with closing(sqlite3.connect(self.db)) as c, c:
+                c.execute('UPDATE work SET result=?,result_provenance=?', (result, signature))
+            with self.assertRaises(ValueError):
+                self.publish()
+            self.assertFalse(cleanup_done(self.db, self.ledger, 'd', 'fake'))
+        self.post.assert_not_called()
+        with closing(sqlite3.connect(self.db)) as c, c:
+            c.execute('UPDATE work SET result=?,result_provenance=?', (original, mac))
+        self.assertTrue(cleanup_done(self.db, self.ledger, 'd', 'fake'))
 
     def test_poll_cannot_publish_modified_dry_mode(self):
         w = self.worker()

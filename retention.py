@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from outbox import valid_identity
-from worker import mode_provenance
+from worker import mode_provenance, valid_result
 
 
 def cleanup_done(queue_path, ledger_path, delivery_id, secret):
@@ -20,7 +20,7 @@ def cleanup_done(queue_path, ledger_path, delivery_id, secret):
         db.execute('ATTACH DATABASE ? AS ledger', (Path(ledger_path).resolve().as_uri() + '?mode=rw',))
         db.execute('BEGIN IMMEDIATE')
         columns = {row[1] for row in db.execute('PRAGMA table_info(work)')}
-        mode = ','.join('w.' + name if name in columns else 'NULL' for name in ('publish_eligible', 'notifications_enabled', 'mode_provenance'))
+        mode = ','.join('w.' + name if name in columns else 'NULL' for name in ('publish_eligible', 'notifications_enabled', 'mode_provenance', 'result_provenance'))
         row = db.execute('''SELECT q.body,w.result,s.signature,''' + mode + ''' FROM queue q
             JOIN work w ON w.delivery_id=q.delivery_id
             JOIN webhook_signatures s ON s.delivery_id=q.delivery_id
@@ -28,7 +28,7 @@ def cleanup_done(queue_path, ledger_path, delivery_id, secret):
               AND w.completed_at <= CAST(strftime('%s','now') AS INTEGER)-7*86400''', (delivery_id,)).fetchone()
         if not row:
             return False
-        body, result, signature, publish_eligible, notifications_enabled, provenance = row
+        body, result, signature, publish_eligible, notifications_enabled, provenance, result_mac = row
         if ((publish_eligible, notifications_enabled) != (None, None)
                 and (publish_eligible not in (0, 1) or notifications_enabled not in (0, 1))):
             return False
@@ -37,6 +37,8 @@ def cleanup_done(queue_path, ledger_path, delivery_id, secret):
             return False
         expected = mode_provenance(secret, delivery_id, body, publish_eligible, notifications_enabled)
         if not expected or not isinstance(provenance, str) or not re.fullmatch(r'[0-9a-f]{64}', provenance) or not hmac.compare_digest(provenance, expected):
+            return False
+        if not valid_result(secret, delivery_id, body, publish_eligible, notifications_enabled, result, result_mac):
             return False
         try:
             event, result = json.loads(body), json.loads(result)
