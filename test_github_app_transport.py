@@ -119,7 +119,7 @@ class TransportTests(unittest.TestCase):
     def test_read_mode_uses_only_explicit_read_auth_and_blocks_git_fallback(self):
         auth = Mock(permission='read')
         auth.token.return_value = ('read-secret', 1)
-        pr = {'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo'}}}
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo'}}}
         with patch('github_adapter.read_transport', return_value=pr) as get, patch('github_adapter._gh_get') as gh, patch('github_adapter._pinned_diff') as git:
             adapter = GitHubReadOnly({12: 'owner/repo'}, auth=auth)
             self.assertEqual(adapter.current('owner/repo', 1)['repo_id'], 12)
