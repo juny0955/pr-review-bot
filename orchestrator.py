@@ -18,7 +18,7 @@ from worker import Worker
 from publish_worker import publish_worker_result
 from github_app_auth import InstallationAuth
 from github_app_transport import installation_transport, inventory_transport, publish_transport, review_list_transport
-from installation_inventory import sync_installation
+from installation_inventory import reconcile_installation, SyncSuperseded
 
 
 def _status(value):
@@ -45,7 +45,9 @@ def notification_loop(outbox, notifier, channel, stop, *, poll_interval=5):
 def inventory_loop(auth, gate, repos, stop, poll_interval=60):
     while not stop.wait(poll_interval):
         try:
-            sync_installation(auth, inventory_transport, gate, repos)
+            reconcile_installation(auth, inventory_transport, gate, repos)
+        except SyncSuperseded:
+            continue
         except Exception:
             _status('inventory_error')
             stop.set()
@@ -184,7 +186,10 @@ def main(argv=None):
         github = (GitHubReadOnly(args.repos, auth=app_read_auth(args.repos))
                   if args.github_app_read else GitHubReadOnly(args.repos))
         if args.sync_installation:
-            sync_installation(github.auth, inventory_transport, args.publication_gate, args.repos)
+            try:
+                reconcile_installation(github.auth, inventory_transport, args.publication_gate, args.repos)
+            except SyncSuperseded:
+                pass  # The periodic reconciler retries; the gate remains paused.
         publish_auth = None
         if args.single_vps_publish:
             read_auth = github.auth

@@ -1,4 +1,4 @@
-"""Local-only GitHub pull request webhook intake; no outbound operations.
+"""Local GitHub webhook intake; optional installation inventory sync is outbound.
 
 Queue entries are never automatically evicted; saturation returns 503.
 Offline retention may replace eligible results with permanent SHA-256 tombstones.
@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from repo_config import allowed
@@ -23,11 +24,14 @@ MAX_BODY = 1024 * 1024
 MAX_QUEUE = 1000
 
 
-def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=None):
+def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=None, sync_inventory=None, invalidate_inventory=None):
     if not secret or not allowed_repos:
         raise ValueError('secret and repository allowlist are required')
     if installation_id is not None and (type(installation_id) is not int or not 0 < installation_id < 2**63):
         raise ValueError('invalid installation ID')
+    if sync_inventory is not None and (installation_id is None or not callable(sync_inventory)):
+        raise ValueError('inventory sync requires a pinned installation')
+    sync_lock = threading.Lock()
     key = secret.encode('utf-8')
     allowed(allowed_repos)
     fd = os.open(db_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -89,7 +93,8 @@ def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=
             delivery = self.headers['X-GitHub-Delivery']
             if not re.fullmatch(r'[A-Za-z0-9-]{1,128}', delivery):
                 return self.reply(400, 'invalid delivery')
-            if self.headers['X-GitHub-Event'] != 'pull_request':
+            event = self.headers['X-GitHub-Event']
+            if event not in ('pull_request', 'installation', 'installation_repositories'):
                 return self.reply(400, 'unsupported event')
             try:
                 payload = json.loads(body)
@@ -101,13 +106,31 @@ def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=
                     if (not isinstance(installation, dict) or type(installation.get('id')) is not int
                             or installation['id'] != installation_id):
                         return self.reply(403, 'installation not allowed')
+                if event != 'pull_request':
+                    if installation_id is None or 'installation' not in payload:
+                        return self.reply(403, 'installation not allowed')
+                    if not isinstance(payload.get('action'), str) or not payload['action']:
+                        return self.reply(400, 'invalid payload')
+                    if sync_inventory is None:
+                        return self.reply(503, 'inventory sync unavailable')
+                    try:
+                        signal = invalidate_inventory() if invalidate_inventory is not None else None
+                        with sync_lock:
+                            if signal is None:
+                                sync_inventory()
+                            else:
+                                sync_inventory(signal=signal)
+                    except Exception:
+                        return self.reply(503, 'inventory sync unavailable')
+                    return self.reply(200, 'inventory synced')
                 repo = payload['repository']['full_name']
                 repo_id = payload['repository'].get('id')
                 try:
                     policy = allowed(allowed_repos)
                 except (OSError, ValueError, TypeError):
                     return self.reply(503, 'repository configuration unavailable')
-                if type(repo_id) is not int or policy.get(repo_id) != repo:
+                if (type(repo_id) is not int or not isinstance(repo, str)
+                        or (policy.get(repo_id) != repo and (sync_inventory is None or 'installation' not in payload))):
                     return self.reply(403, 'repository not allowed')
                 action = payload['action']
                 number = payload['number']
@@ -119,6 +142,17 @@ def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=
                     or type(pr['draft']) is not bool or pr['state'] not in ('open', 'closed')
                     or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
                     return self.reply(400, 'invalid payload')
+                if policy.get(repo_id) != repo:
+                    if sync_inventory is None or 'installation' not in payload:
+                        return self.reply(403, 'repository not allowed')
+                    try:
+                        with sync_lock:
+                            snapshot = sync_inventory()
+                            policy = allowed(allowed_repos)
+                    except Exception:
+                        return self.reply(503, 'inventory sync unavailable')
+                    if not isinstance(snapshot, dict) or snapshot.get(repo_id) != repo or policy.get(repo_id) != repo:
+                        return self.reply(403, 'repository not allowed')
                 # ponytail: incomplete legacy payloads use exact-body deduplication.
                 event_key = None
                 base = pr.get('base', {}).get('sha') if isinstance(pr.get('base'), dict) else None
@@ -172,7 +206,17 @@ def main():
         if not re.fullmatch(r'[0-9]{1,19}', installation):
             raise ValueError('invalid installation ID')
         installation = int(installation)
-    server = create_server(secret, repos, db, port, installation_id=installation)
+    sync = None
+    invalidate = None
+    gate = os.environ.get('PUBLICATION_GATE')
+    if gate:
+        from github_adapter import app_read_auth
+        from github_app_transport import inventory_transport
+        from installation_inventory import sync_installation, invalidate_inventory
+        auth = app_read_auth(repos)
+        sync = lambda *, signal=None: sync_installation(auth, inventory_transport, gate, repos, signal=signal)
+        invalidate = lambda: invalidate_inventory(gate)
+    server = create_server(secret, repos, db, port, installation_id=installation, sync_inventory=sync, invalidate_inventory=invalidate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

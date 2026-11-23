@@ -167,6 +167,52 @@ class SecurityTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as db:
             self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 2)
 
+    def test_signed_installation_sync_and_unknown_repo(self):
+        from receiver import create_server
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        policy = Path(self.tmp.name) / 'repos.json'
+        policy.write_text(json.dumps({'repositories': [{'id': 123, 'full_name': 'acme/repo', 'enabled': True}]}))
+        calls = []
+        invalidations = []
+        def sync(*, signal=None):
+            calls.append(signal)
+            policy.write_text(json.dumps({'repositories': [{'id': 456, 'full_name': 'acme/new', 'enabled': True}]}))
+            return {456: 'acme/new'}
+        def invalidate():
+            nonce = str(len(invalidations) + 1)
+            invalidations.append(nonce)
+            return nonce
+        self.server = create_server('secret', str(policy), self.db, port=0, installation_id=42, sync_inventory=sync, invalidate_inventory=invalidate)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        change = json.dumps({'installation': {'id': 42}, 'action': 'added'}).encode()
+        headers = {'X-GitHub-Event': 'installation_repositories'}
+        self.assertEqual(self.send(change, dict(headers, **{'X-Hub-Signature-256': 'sha256=' + '0' * 64})), 401)
+        self.assertEqual(self.send(json.dumps({'installation': {'id': 43}, 'action': 'added'}).encode(), headers), 403)
+        self.assertEqual(calls, [])
+        self.assertEqual(invalidations, [])
+        new = payload(repository={'id': 456, 'full_name': 'acme/new'}, installation={'id': 42})
+        self.assertEqual(self.send(new), 202)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.send(change, headers), 200)
+        self.assertEqual(self.send(change, {'X-GitHub-Event': 'installation'}), 200)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(invalidations), 2)
+        self.assertEqual(calls, [None, '1', '2'])
+        self.assertEqual(self.send(new, {'X-GitHub-Delivery': 'again'}), 200)
+
+    def test_unknown_repository_requires_verified_inventory(self):
+        from receiver import create_server
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        from unittest.mock import Mock
+        sync = Mock(side_effect=[{}, RuntimeError('offline')])
+        self.server = create_server('secret', {123: 'acme/repo'}, self.db, port=0, installation_id=42, sync_inventory=sync)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        new = payload(repository={'id': 456, 'full_name': 'acme/new'}, installation={'id': 42})
+        self.assertEqual(self.send(new), 403)
+        self.assertEqual(self.send(new), 503)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 0)
+
     def test_installation_configuration_fails_closed(self):
         from receiver import create_server, main
         for invalid in (True, 0, -1, '42', 2**63):

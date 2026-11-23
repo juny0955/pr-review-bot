@@ -137,12 +137,13 @@ def update_gate(path, policy, approvals, *, expected=None, auto_repos=None):
 @contextmanager
 def authorize(path, identity, *, single_vps_mvp=False):
     with locked_gate(path) as directory:
-        try:
-            os.stat('inventory-paused', dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ValueError('installation inventory synchronization paused')
+        for marker in ('inventory-paused', 'inventory-signal'):
+            try:
+                os.stat(marker, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError('installation inventory synchronization paused')
         try:
             fd = os.open('inventory-valid', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         except FileNotFoundError:

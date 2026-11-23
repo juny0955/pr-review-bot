@@ -42,6 +42,231 @@ class ReconcileTests(unittest.TestCase):
         sync_installation(self.auth, transport, self.gate, self.policy)
         self.assertEqual(transport.call_count, 2)
 
+    def test_reconciler_recovers_crash_and_retries_new_signal(self):
+        import multiprocessing
+        import orchestrator
+        from installation_inventory import invalidate_inventory
+        ctx = multiprocessing.get_context('fork')
+        first = invalidate_inventory(self.gate)
+        def crash():
+            def transport(*args): os._exit(37)
+            sync_installation(self.auth, transport, self.gate, self.policy, signal=first)
+        child = ctx.Process(target=crash)
+        child.start(); child.join(10)
+        if child.is_alive():
+            child.terminate(); child.join()
+        self.assertEqual(child.exitcode, 37)
+        calls = []
+        def transport(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                invalidate_inventory(self.gate)
+            return {'total_count': 0, 'repositories': []}
+        class Stop:
+            count = 0
+            def wait(self, interval):
+                self.count += 1
+                return self.count > 2
+            def set(self):
+                self.count = 3
+        with patch.object(orchestrator, 'inventory_transport', transport):
+            orchestrator.inventory_loop(self.auth, self.gate, self.policy, Stop())
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(allowed(self.policy), {})
+        self.assertFalse((self.gate / 'inventory-signal').exists())
+        self.assertFalse((self.gate / 'inventory-paused').exists())
+
+    def test_invalidation_crash_preserves_signal_and_supersedes_inflight(self):
+        import multiprocessing
+        from installation_inventory import invalidate_inventory, reconcile_installation, SyncSuperseded
+        ctx = multiprocessing.get_context('fork')
+        for existing in (False, True):
+            for stage in ('open', 'write', 'file_fsync', 'rename', 'dir_fsync'):
+                with self.subTest(existing=existing, stage=stage):
+                    for name in ('inventory-signal', 'inventory-paused'):
+                        (self.gate / name).unlink(missing_ok=True)
+                    old = invalidate_inventory(self.gate) if existing else None
+                    entered, resume = ctx.Event(), ctx.Event()
+                    result = ctx.Queue()
+                    def inflight():
+                        def fetch(*args):
+                            entered.set()
+                            if not resume.wait(10): raise RuntimeError('timeout')
+                            return {'total_count': 1, 'repositories': [{'id': 1, 'full_name': 'old/one', 'private': False}]}
+                        try:
+                            sync_installation(self.auth, fetch, self.gate, self.policy, signal=old)
+                            result.put('completed')
+                        except SyncSuperseded:
+                            result.put('superseded')
+                    process = ctx.Process(target=inflight)
+                    process.start()
+                    try:
+                        self.assertTrue(entered.wait(10))
+                        def crash():
+                            import installation_inventory as inv
+                            real_open, real_fsync, real_replace, real_fdopen = os.open, os.fsync, os.replace, os.fdopen
+                            temp_fd = [-1]
+                            renamed = [False]
+                            def op(name, flags, *args, **kwargs):
+                                if str(name).startswith('.signal-'):
+                                    if stage == 'open': os._exit(37)
+                                    fd = real_open(name, flags, *args, **kwargs)
+                                    temp_fd[0] = fd
+                                    return fd
+                                return real_open(name, flags, *args, **kwargs)
+                            def fdopen(fd, *args, **kwargs):
+                                if fd == temp_fd[0] and stage == 'write':
+                                    os.write(fd, b'partial')
+                                    os._exit(37)
+                                return real_fdopen(fd, *args, **kwargs)
+                            def fsync(fd):
+                                if fd == temp_fd[0] and stage == 'file_fsync': os._exit(37)
+                                if renamed[0] and stage == 'dir_fsync': os._exit(37)
+                                return real_fsync(fd)
+                            def replace(*args, **kwargs):
+                                if stage == 'rename': os._exit(37)
+                                real_replace(*args, **kwargs)
+                                renamed[0] = True
+                            with patch.object(inv.os, 'open', side_effect=op), patch.object(inv.os, 'fdopen', side_effect=fdopen), patch.object(inv.os, 'fsync', side_effect=fsync), patch.object(inv.os, 'replace', side_effect=replace):
+                                invalidate_inventory(self.gate)
+                        child = ctx.Process(target=crash)
+                        child.start(); child.join(10)
+                        if child.is_alive(): child.terminate(); child.join()
+                        self.assertEqual(child.exitcode, 37)
+                        marker = self.gate / 'inventory-signal'
+                        actual = marker.read_text() if marker.exists() else None
+                        if stage != 'dir_fsync': self.assertEqual(actual, old)
+                        else: self.assertRegex(actual or '', r'^[0-9a-f]{32}$')
+                        with self.assertRaises(ValueError):
+                            with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+                        resume.set(); process.join(10)
+                        self.assertEqual(process.exitcode, 0)
+                        self.assertEqual(result.get(timeout=2), 'superseded')
+                        transport = Mock(return_value={'total_count': 0, 'repositories': []})
+                        reconcile_installation(self.auth, transport, self.gate, self.policy)
+                        self.assertEqual(transport.call_count, 2)
+                        self.assertFalse(marker.exists())
+                        self.assertFalse((self.gate / 'inventory-paused').exists())
+                    finally:
+                        resume.set()
+                        if process.is_alive(): process.terminate(); process.join()
+                        result.close()
+
+    def test_reconciler_rejects_invalid_signal_without_fetching(self):
+        from installation_inventory import reconcile_installation
+        marker = self.gate / 'inventory-signal'
+        for value in ('', 'f' * 31, 'g' * 32, 'f' * 33):
+            marker.write_text(value)
+            transport = Mock()
+            with self.assertRaises(ValueError):
+                reconcile_installation(self.auth, transport, self.gate, self.policy)
+            transport.assert_not_called()
+            self.assertEqual(marker.read_text(), value)
+            with self.assertRaises(ValueError):
+                with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+
+    def test_pending_signal_cannot_be_consumed_by_unrelated_sync(self):
+        from installation_inventory import invalidate_inventory, SyncSuperseded
+        entries = [{'id': 1, 'full_name': 'old/one', 'private': False}]
+        self.sync(entries)
+        signal = invalidate_inventory(self.gate)
+        with self.assertRaises(SyncSuperseded):
+            self.sync(entries)
+        with self.assertRaises(ValueError):
+            with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+        transport = Mock(return_value={'total_count': 0, 'repositories': []})
+        sync_installation(self.auth, transport, self.gate, self.policy, signal=signal)
+        with self.assertRaises(ValueError):
+            with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+
+    def test_cross_process_signal_races_and_crash_recovery(self):
+        import multiprocessing
+        from installation_inventory import invalidate_inventory, SyncSuperseded
+        ctx = multiprocessing.get_context('fork')
+        entries = [{'id': 1, 'full_name': 'old/one', 'private': False}]
+        self.sync(entries)
+        entered, resume = ctx.Event(), ctx.Event()
+        results = ctx.Queue()
+        def background_sync():
+            def transport(*args):
+                entered.set()
+                if not resume.wait(10):
+                    raise RuntimeError('test timeout')
+                return {'total_count': 1, 'repositories': entries}
+            try:
+                sync_installation(self.auth, transport, self.gate, self.policy)
+                results.put('authorized')
+            except SyncSuperseded:
+                results.put('superseded')
+        process = ctx.Process(target=background_sync)
+        process.start()
+        try:
+            self.assertTrue(entered.wait(10))
+            first = invalidate_inventory(self.gate)
+            second = invalidate_inventory(self.gate)
+            with self.assertRaises(SyncSuperseded):
+                sync_installation(self.auth, Mock(), self.gate, self.policy, signal=first)
+            resume.set()
+            process.join(10)
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(results.get(timeout=2), 'superseded')
+            with self.assertRaises(ValueError):
+                with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+            def crash():
+                def transport(*args): os._exit(37)
+                sync_installation(self.auth, transport, self.gate, self.policy, signal=second)
+            child = ctx.Process(target=crash)
+            child.start(); child.join(10)
+            self.assertEqual(child.exitcode, 37)
+            with self.assertRaises(SyncSuperseded): self.sync(entries)
+            with self.assertRaises(ValueError):
+                with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+            recovery = invalidate_inventory(self.gate)
+            transport = Mock(return_value={'total_count': 0, 'repositories': []})
+            sync_installation(self.auth, transport, self.gate, self.policy, signal=recovery)
+            with self.assertRaises(ValueError):
+                with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+        finally:
+            resume.set()
+            if process.is_alive(): process.terminate(); process.join()
+            results.close()
+
+    def test_signal_sync_superseded_during_fetch_across_processes(self):
+        import multiprocessing
+        from installation_inventory import invalidate_inventory, SyncSuperseded
+        ctx = multiprocessing.get_context('fork')
+        entered, resume = ctx.Event(), ctx.Event()
+        results = ctx.Queue()
+        first = invalidate_inventory(self.gate)
+        def receiver_sync():
+            def transport(*args):
+                entered.set()
+                if not resume.wait(10): raise RuntimeError('test timeout')
+                return {'total_count': 1, 'repositories': [{'id': 1, 'full_name': 'old/one', 'private': False}]}
+            try:
+                sync_installation(self.auth, transport, self.gate, self.policy, signal=first)
+                results.put('completed')
+            except SyncSuperseded:
+                results.put('superseded')
+        process = ctx.Process(target=receiver_sync)
+        process.start()
+        try:
+            self.assertTrue(entered.wait(10))
+            second = invalidate_inventory(self.gate)
+            with self.assertRaises(SyncSuperseded): self.sync([])
+            resume.set(); process.join(10)
+            self.assertEqual(process.exitcode, 0)
+            self.assertEqual(results.get(timeout=2), 'superseded')
+            with self.assertRaises(ValueError):
+                with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+            transport = Mock(return_value={'total_count': 0, 'repositories': []})
+            sync_installation(self.auth, transport, self.gate, self.policy, signal=second)
+            self.assertEqual(allowed(self.policy), {})
+        finally:
+            resume.set()
+            if process.is_alive(): process.terminate(); process.join()
+            results.close()
+
     def test_full_sync_revokes_renames_and_private(self):
         self.sync([{'id': 1, 'full_name': 'new/one', 'private': False},
                    {'id': 2, 'full_name': 'old/two', 'private': True},
@@ -87,6 +312,28 @@ class ReconcileTests(unittest.TestCase):
             self.sync([{'id': 1, 'full_name': 'old/one', 'private': False}])
         with patch('time.time', return_value=1121), self.assertRaises(ValueError):
             with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+
+    def test_baseline_is_captured_under_pause_lock_and_signal_supersedes_sync(self):
+        from installation_inventory import _policy_bytes
+        def read_policy(path):
+            with self.assertRaises(TimeoutError):
+                with locked_gate(self.gate, timeout=0): pass
+            return _policy_bytes(path)
+        signals = []
+        def signal(*args):
+            from installation_inventory import invalidate_inventory
+            signals.append(invalidate_inventory(self.gate))
+            return {'total_count': 0, 'repositories': []}
+        before = self.policy.read_bytes(), gate_snapshot(self.gate)
+        with patch('installation_inventory._policy_bytes', side_effect=read_policy):
+            with self.assertRaisesRegex(ValueError, 'superseded'):
+                sync_installation(self.auth, signal, self.gate, self.policy)
+        self.assertEqual((self.policy.read_bytes(), gate_snapshot(self.gate)), before)
+        with self.assertRaises(ValueError):
+            with authorize(self.gate, self.approval, single_vps_mvp=True): pass
+        transport = Mock(return_value={'total_count': 1, 'repositories': [{'id': 1, 'full_name': 'old/one', 'private': False}]})
+        sync_installation(self.auth, transport, self.gate, self.policy, signal=signals[-1])
+        with authorize(self.gate, self.approval, single_vps_mvp=True): pass
 
     def test_policy_conflict_preserves_gate(self):
         before = gate_snapshot(self.gate)
@@ -211,6 +458,8 @@ class ReconcileTests(unittest.TestCase):
              patch.object(orchestrator, 'Worker'), patch.object(orchestrator, 'run_loop', side_effect=run), \
              patch.object(orchestrator.threading.Thread, 'join', autospec=True, side_effect=original_join) as join, \
              redirect_stdout(StringIO()):
+            from installation_inventory import invalidate_inventory
+            invalidate_inventory(self.gate)
             self.assertEqual(orchestrator.main(args), 0)
             self.assertEqual(orchestrator.main(args), 0)
             self.assertEqual(join.call_count, 2)

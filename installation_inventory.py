@@ -14,6 +14,10 @@ MAX_REPOSITORIES = 100_000
 PAGE_SIZE = 100
 
 
+class SyncSuperseded(ValueError):
+    pass
+
+
 def _snapshot(fetch):
     repositories = {}
     names = set()
@@ -125,38 +129,96 @@ def _replace_policy(path, data, mode):
             os.unlink(temporary)
 
 
-def sync_installation(auth, transport, gate, policy_path):
+def invalidate_inventory(gate):
+    """Pause publication and supersede any in-flight inventory snapshot."""
+    from revocation_gate import locked_gate
+    signal = secrets.token_hex(16)
+    with locked_gate(gate) as directory:
+        # Invalidate the in-flight sync before replacing its signal, even on crash.
+        fd = os.open('inventory-paused', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, 'w') as marker:
+            marker.write(signal)
+            marker.flush()
+            os.fsync(marker.fileno())
+        os.fsync(directory)
+        name = '.signal-' + secrets.token_hex(16)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with os.fdopen(fd, 'w') as marker:
+                marker.write(signal)
+                marker.flush()
+                os.fsync(marker.fileno())
+            os.replace(name, 'inventory-signal', src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+    return signal
+
+
+def _signal(directory):
+    try:
+        fd = os.open('inventory-signal', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd) as marker:
+        return marker.read(33)
+
+
+def reconcile_installation(auth, transport, gate, policy_path):
+    from revocation_gate import locked_gate
+    # ponytail: read under the gate; sync rechecks it before and after fetching.
+    with locked_gate(gate) as directory:
+        signal = _signal(directory)
+    return sync_installation(auth, transport, gate, policy_path, signal=signal)
+
+
+def sync_installation(auth, transport, gate, policy_path, *, signal=None):
     """Sync a complete public snapshot; all policy writers must share gate lock.
 
     Concurrent webhooks must also serialize against this sync or invalidate its
     gate revision. Two GitHub reads cannot provide a transactional snapshot.
     """
-    from revocation_gate import gate_snapshot, locked_gate, _read_state, _version, _write_state
+    from revocation_gate import locked_gate, _read_state, _version, _write_state
+    if signal is not None and (not isinstance(signal, str) or len(signal) != 32
+                               or any(c not in '0123456789abcdef' for c in signal)):
+        raise ValueError('invalid installation signal')
     # ponytail: a persistent pause survives crashes and blocks every gate user.
     nonce = secrets.token_hex(16)
     with locked_gate(gate) as directory:
+        if _signal(directory) != signal:
+            raise SyncSuperseded('installation signal pending or superseded')
         fd = os.open('inventory-paused', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         with os.fdopen(fd, 'w') as marker:
             marker.write(nonce)
             marker.flush()
             os.fsync(marker.fileno())
         os.fsync(directory)
+        # Capture the baseline under the same lock as the pause: a signal must
+        # not be absorbed into a later baseline after the sync has started.
+        old_data, mode, old_policy = _policy_bytes(policy_path)
+        version = _version(_read_state(directory))
     started = int(time.time())
-    old_data, mode, old_policy = _policy_bytes(policy_path)
-    _, version = gate_snapshot(gate)
     token, _ = auth.inventory_token()
     snapshot = installation_snapshot(transport, token)
     new_data = json.dumps({'repositories': [
         {'id': ident, 'full_name': name, 'enabled': True}
         for ident, name in sorted(snapshot.items())]}, separators=(',', ':')).encode()
     with locked_gate(gate) as directory:
+        if _signal(directory) != signal:
+            raise SyncSuperseded('installation signal superseded')
+        try:
+            fd = os.open('inventory-paused', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            raise SyncSuperseded('installation sync superseded')
+        with os.fdopen(fd) as marker:
+            if marker.read(33) != nonce:
+                raise SyncSuperseded('installation sync superseded')
         state = _read_state(directory)
         if _version(state) != version or _policy_bytes(policy_path)[:2] != (old_data, mode):
             raise ValueError('installation sync conflict')
-        fd = os.open('inventory-paused', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(fd) as marker:
-            if marker.read(33) != nonce:
-                raise ValueError('installation sync superseded')
         matches = lambda ident, name: snapshot.get(ident) == name and old_policy.get(ident) == name and state['policy'].get(str(ident)) == name
         approvals = [entry for entry in state['approvals'] if matches(entry[0], entry[1])]
         # ponytail: stage revocations before changing the file; additions wait
@@ -173,6 +235,8 @@ def sync_installation(auth, transport, gate, policy_path):
             validity.flush()
             os.fsync(validity.fileno())
         os.unlink('inventory-paused', dir_fd=directory)
+        if signal is not None:
+            os.unlink('inventory-signal', dir_fd=directory)
         try:
             os.fsync(directory)
         except OSError:
