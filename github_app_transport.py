@@ -149,6 +149,18 @@ def installation_transport(jwt, installation_id, body):
     return result
 
 
+def inventory_transport(token, path):
+    # ponytail: cap pages to the inventory validator's 100,000 repository limit.
+    if (not isinstance(path, str) or not re.fullmatch(
+            r'/installation/repositories\?per_page=100&page=[1-9][0-9]{0,3}', path)
+            or int(path.rsplit('=', 1)[1]) > 1000):
+        raise RuntimeError('GitHub transport failed')
+    result = _request('GET', path, token)
+    if not isinstance(result, dict):
+        raise RuntimeError('GitHub transport failed')
+    return result
+
+
 def read_transport(token, path):
     if (not isinstance(path, str) or not _PATH.fullmatch(path)
             or any(part in ('.', '..') for part in path.split('/'))):

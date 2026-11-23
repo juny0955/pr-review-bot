@@ -19,7 +19,6 @@ from repo_config import allowed
 from inline_review import unpack_review, changed_lines
 
 SHA = re.compile(r'[0-9a-f]{40}\Z')
-MVP_REPOS = {1466550689: 'juny0955/pr-review-bot', 1447840098: 'juny0955/rfsync'}
 # ponytail: known patterns only; use a maintained secret scanner for broader coverage.
 SECRET = re.compile(
     r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|'
@@ -68,8 +67,7 @@ def _guard_publish(publish_locked):
             return 'dry_run'
         if not self.single_vps_mvp:
             _require_operational_isolation()
-        elif MVP_REPOS.get(repo_id) != repo:
-            raise ValueError('MVP repository not allowed')
+
         identity = [repo_id, repo, number, sha, base_sha, hashlib.sha256(review.encode('utf-8')).hexdigest()]
         # ponytail: one global lock serializes all posts; shard only if throughput requires it.
         with _require_revocation_gate(self.gate_path, identity, single_vps_mvp=self.single_vps_mvp):

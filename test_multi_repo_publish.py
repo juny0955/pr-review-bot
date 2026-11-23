@@ -10,16 +10,18 @@ from contextlib import closing, nullcontext, redirect_stdout
 from unittest.mock import Mock, call, patch
 
 from orchestrator import main, publication_loop
-from publisher import GitHubPublisher, MVP_REPOS
+from publisher import GitHubPublisher
 from worker import mode_provenance, result_provenance
+
+REPOS = {1466550689: 'juny0955/pr-review-bot', 123: 'other/repo'}
 
 
 class MultiRepoPublish(unittest.TestCase):
-    def test_startup_accepts_only_exact_enabled_pairs(self):
-        pairs = list(MVP_REPOS.items())
+    def test_startup_accepts_configured_repositories(self):
+        pairs = list(REPOS.items())
         configs = [(dict(pairs), 0), ({pairs[1][0]: pairs[1][1]}, 0),
-                   ({}, 1), ({pairs[0][0]: pairs[1][1]}, 1),
-                   ({**MVP_REPOS, 123: 'other/repo'}, 1)]
+                   ({}, 1), ({pairs[0][0]: pairs[1][1]}, 0),
+                   ({456: 'another/project'}, 0)]
         with tempfile.TemporaryDirectory() as root:
             db = os.path.join(root, 'queue')
             open(db, 'w').close()
@@ -45,7 +47,7 @@ class MultiRepoPublish(unittest.TestCase):
             db, ledger = os.path.join(root, 'queue'), os.path.join(root, 'ledger')
             with closing(sqlite3.connect(db)) as conn, conn:
                 conn.executescript('CREATE TABLE queue(delivery_id TEXT, body BLOB); CREATE TABLE work(delivery_id TEXT, status TEXT, result TEXT, publish_eligible INTEGER, notifications_enabled INTEGER, mode_provenance TEXT, result_provenance TEXT); CREATE TABLE webhook_signatures(delivery_id TEXT, signature TEXT);')
-                for ident, name in MVP_REPOS.items():
+                for ident, name in REPOS.items():
                     delivery = str(ident)
                     body = json.dumps({'repository': {'id': ident, 'full_name': name}, 'number': 7, 'pull_request': {'number': 7, 'head': {'sha': head}, 'state': 'open', 'draft': False}, 'action': 'opened'}).encode()
                     result = json.dumps({'status': 'done', 'repo_id': ident, 'repository': name, 'number': 7, 'sha': head, 'base_sha': base, 'review': 'review'})
@@ -53,7 +55,7 @@ class MultiRepoPublish(unittest.TestCase):
                     conn.execute('INSERT INTO work VALUES (?,?,?,?,?,?,?)', (delivery, 'done', result, 1, 0, mode_provenance(secret, delivery, body, 1, 0), result_provenance(secret, delivery, body, 1, 0, result)))
                     conn.execute('INSERT INTO webhook_signatures VALUES (?,?)', (delivery, 'sha256=' + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()))
             github, auth = Mock(), Mock()
-            github.current.side_effect = lambda name, number: {'repo_id': next(i for i, n in MVP_REPOS.items() if n == name), 'repo': name, 'state': 'open', 'draft': False, 'sha': head, 'base_sha': base}
+            github.current.side_effect = lambda name, number: {'repo_id': next(i for i, n in REPOS.items() if n == name), 'repo': name, 'state': 'open', 'draft': False, 'sha': head, 'base_sha': base}
             auth.token.side_effect = lambda ident, name: (str(ident), 999)
             posted = {}
             def post(token, path, body):
@@ -62,11 +64,12 @@ class MultiRepoPublish(unittest.TestCase):
             def get(token, path):
                 return [{'commit_id': head, 'body': posted[path.split('?')[0]]['body']}]
             stop = Stop()
-            with patch('publisher._require_revocation_gate', return_value=nullcontext()), patch('orchestrator.time.monotonic', side_effect=lambda: stop.count * 5), patch('orchestrator.publish_transport', side_effect=post) as post_mock, patch('orchestrator.review_list_transport', side_effect=get) as get_mock:
-                publication_loop(db, MVP_REPOS, github, auth, ledger, 'gate', secret, stop)
+            with patch('publisher._require_revocation_gate', return_value=nullcontext()) as gate_mock, patch('orchestrator.time.monotonic', side_effect=lambda: stop.count * 5), patch('orchestrator.publish_transport', side_effect=post) as post_mock, patch('orchestrator.review_list_transport', side_effect=get) as get_mock:
+                publication_loop(db, REPOS, github, auth, ledger, 'gate', secret, stop)
+            self.assertTrue(any(c.args[1][:2] == [123, 'other/repo'] and c.kwargs == {'single_vps_mvp': True} for c in gate_mock.call_args_list))
             self.assertEqual(post_mock.call_count, 2)
             self.assertEqual(get_mock.call_count, 2)
-            for ident, name in MVP_REPOS.items():
+            for ident, name in REPOS.items():
                 path = '/repos/' + name + '/pulls/7/reviews'
                 self.assertIn(call(ident, name), auth.token.call_args_list)
                 self.assertTrue(any(c.args[:2] == (str(ident), path) for c in post_mock.call_args_list))
@@ -74,8 +77,8 @@ class MultiRepoPublish(unittest.TestCase):
 
     def test_reject_mismatched_and_locally_disabled_pairs(self):
         head, base = 'a' * 40, 'b' * 40
-        pairs = list(MVP_REPOS.items())
-        for repos, ident, name in [({pairs[0][0]: pairs[1][1]}, pairs[0][0], pairs[1][1]), ({pairs[0][0]: pairs[0][1]}, *pairs[1])]:
+        pairs = list(REPOS.items())
+        for repos, ident, name in [({pairs[0][0]: pairs[0][1]}, pairs[0][0], pairs[1][1]), ({pairs[0][0]: pairs[0][1]}, *pairs[1])]:
             post = Mock()
             publisher = GitHubPublisher(post, Mock(), repos, enabled=True, single_vps_mvp=True)
             with self.assertRaises(ValueError):

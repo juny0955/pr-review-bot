@@ -92,6 +92,90 @@ class SecurityTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as db:
             self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 1)
 
+    def test_semantic_dedup_concurrent_restart_and_security(self):
+        from receiver import create_server
+        pr = json.loads(payload())['pull_request']
+        pr.update(base={'sha': 'b' * 40}, updated_at='2026-01-02T03:04:05Z')
+        bodies = [payload(pull_request=pr), payload(pull_request=pr, installation={'id': 42})]
+        barrier = threading.Barrier(3)
+        statuses = []
+        def send(i):
+            barrier.wait()
+            statuses.append(self.send(bodies[i], {'X-GitHub-Delivery': f'concurrent-{i}'}))
+        threads = [threading.Thread(target=send, args=(i,)) for i in range(2)]
+        for thread in threads: thread.start()
+        barrier.wait()
+        for thread in threads: thread.join()
+        self.assertEqual(sorted(statuses), [200, 202])
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        self.server = create_server('secret', {123: 'acme/repo'}, self.db, port=0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        self.assertEqual(self.send(bodies[1], {'X-GitHub-Delivery': 'third', 'X-Hub-Signature-256': 'sha256=' + '0' * 64}), 401)
+        self.assertEqual(self.send(bodies[1], {'X-GitHub-Delivery': 'third'}), 200)
+        self.assertEqual(self.send(payload(action='reopened', pull_request=pr), {'X-GitHub-Delivery': 'third'}), 409)
+        pr['updated_at'] = '2026-01-02T03:04:06Z'
+        self.assertEqual(self.send(payload(pull_request=pr), {'X-GitHub-Delivery': 'new-event'}), 202)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT count(*) FROM webhook_semantic').fetchone()[0], 2)
+
+    def test_fixed_installation_and_exact_deduplication(self):
+        from receiver import create_server
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        self.server = create_server('secret', {123: 'acme/repo'}, self.db, port=0, installation_id=42)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        for installation in (None, {}, {'id': True}, {'id': '42'}, {'id': 43}, [], 42):
+            with self.subTest(installation=installation):
+                self.assertEqual(self.send(payload(installation=installation)), 403)
+        self.assertEqual(self.send(b'[]'), 400)
+        body = payload(installation={'id': 42})
+        self.assertEqual(self.send(body), 202)
+        self.assertEqual(self.send(body), 200)
+        self.assertEqual(self.send(body, {'X-GitHub-Delivery': 'other'}), 200)
+        self.assertEqual(self.send(payload(installation={'id': 42}, action='reopened')), 409)
+        with closing(sqlite3.connect(self.db)) as db, db:
+            self.assertEqual(db.execute('SELECT delivery_id, body FROM queue').fetchall(), [('test-id', body)])
+            db.execute('DELETE FROM queue')
+            db.execute('INSERT INTO tombstone VALUES (?, ?)', ('test-id', hashlib.sha256(body).digest()))
+        self.assertEqual(self.send(body), 200)
+        self.assertEqual(self.send(body, {'X-GitHub-Delivery': 'other'}), 200)
+        self.assertEqual(self.send(payload(installation={'id': 42}, action='reopened')), 409)
+
+    def test_fixed_installation_legacy_app_and_new_repo(self):
+        from receiver import create_server
+        self.server.shutdown(); self.server.server_close(); self.thread.join()
+        policy = Path(self.tmp.name) / 'repos.json'
+        entries = [{'id': 123, 'full_name': 'acme/repo', 'enabled': True}]
+        policy.write_text(json.dumps({'repositories': entries}))
+        self.server = create_server('secret', str(policy), self.db, port=0, installation_id=42)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
+        pr = json.loads(payload())['pull_request']
+        pr.update(base={'sha': 'b' * 40}, updated_at='2026-01-02T03:04:05Z')
+        legacy = payload(pull_request=pr)
+        app = payload(pull_request=pr, installation={'id': 42})
+        self.assertEqual(self.send(legacy, {'X-Hub-Signature-256': 'sha256=' + '0' * 64}), 401)
+        self.assertEqual(self.send(payload(pull_request=pr, installation={'id': 43})), 403)
+        self.assertEqual(self.send(legacy), 202)
+        self.assertEqual(self.send(app, {'X-GitHub-Delivery': 'app'}), 200)
+        new = payload(repository={'id': 456, 'full_name': 'acme/new'}, pull_request=pr, installation={'id': 42})
+        self.assertEqual(self.send(new, {'X-GitHub-Delivery': 'new'}), 403)
+        entries.append({'id': 456, 'full_name': 'acme/new', 'enabled': True})
+        policy.write_text(json.dumps({'repositories': entries}))
+        self.assertEqual(self.send(new, {'X-GitHub-Delivery': 'new'}), 202)
+        self.assertEqual(self.send(payload(repository={'id': 456, 'full_name': 'acme/new'}, pull_request=pr), {'X-GitHub-Delivery': 'new-legacy'}), 200)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM queue').fetchone()[0], 2)
+
+    def test_installation_configuration_fails_closed(self):
+        from receiver import create_server, main
+        for invalid in (True, 0, -1, '42', 2**63):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                create_server('secret', {123: 'acme/repo'}, self.db, port=0, installation_id=invalid)
+        for invalid in ('', ' 42', '+42', '0', str(2**63)):
+            with self.subTest(invalid=invalid), patch('receiver.allowed', return_value={123: 'acme/repo'}), patch.dict('os.environ', {'GITHUB_APP_INSTALLATION_ID': invalid, 'WEBHOOK_SECRET': 'secret', 'REPO_CONFIG': 'unused', 'QUEUE_DB': self.db}), self.assertRaises(ValueError):
+                main()
+
     def test_rejects_malformed_pr_fields(self):
         invalid = [payload(action='changed'), payload(action=[]), payload(number=True),
                    payload(number=0), payload(pull_request={}),
