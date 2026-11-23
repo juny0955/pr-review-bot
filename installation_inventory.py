@@ -234,6 +234,8 @@ def sync_installation(auth, transport, gate, policy_path, *, signal=None):
             validity.write(str(started))
             validity.flush()
             os.fsync(validity.fileno())
+        # Persist the validity name before removing the durable pause.
+        os.fsync(directory)
         os.unlink('inventory-paused', dir_fd=directory)
         if signal is not None:
             os.unlink('inventory-signal', dir_fd=directory)

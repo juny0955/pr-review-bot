@@ -64,6 +64,78 @@ class SyncFailureTests(unittest.TestCase):
                     self.sync()
                 self.check_paused_and_recover()
 
+    def test_valid_marker_is_durable_before_unlink_and_fsync_failure_keeps_pause(self):
+        for signalled in (False, True):
+            for fail in (False, True):
+                with self.subTest(signalled=signalled, fail=fail):
+                    (self.gate / 'inventory-valid').unlink(missing_ok=True)
+                    signal = inventory.invalidate_inventory(self.gate) if signalled else None
+                    real_fsync, real_unlink = os.fsync, os.unlink
+                    valid_synced = directory_synced = False
+                    def fsync(fd):
+                        nonlocal valid_synced, directory_synced
+                        info = os.fstat(fd)
+                        valid = self.gate / 'inventory-valid'
+                        if valid.exists() and info.st_ino == valid.stat().st_ino and info.st_dev == valid.stat().st_dev:
+                            real_fsync(fd)
+                            valid_synced = True
+                            return
+                        if valid_synced and (info.st_dev, info.st_ino) == (self.gate.stat().st_dev, self.gate.stat().st_ino):
+                            if fail and not directory_synced:
+                                raise OSError('injected validity directory fsync failure')
+                            real_fsync(fd)
+                            directory_synced = True
+                            return
+                        real_fsync(fd)
+                    def unlink(path, *args, **kwargs):
+                        if path in ('inventory-paused', 'inventory-signal'):
+                            self.assertTrue(directory_synced, 'unlink before validity directory fsync')
+                        return real_unlink(path, *args, **kwargs)
+                    with patch('os.fsync', side_effect=fsync), patch('os.unlink', side_effect=unlink):
+                        if fail:
+                            with self.assertRaises(OSError):
+                                inventory.sync_installation(self.auth, self.transport, self.gate, self.policy, signal=signal)
+                        else:
+                            inventory.sync_installation(self.auth, self.transport, self.gate, self.policy, signal=signal)
+                    self.assertTrue(valid_synced)
+                    if fail:
+                        self.assertTrue((self.gate / 'inventory-paused').exists())
+                        self.assertEqual((self.gate / 'inventory-signal').exists(), signalled)
+                        with self.assertRaises(ValueError):
+                            with gate.authorize(self.gate, self.identity, single_vps_mvp=True):
+                                pass
+                        inventory.reconcile_installation(self.auth, self.transport, self.gate, self.policy)
+                    else:
+                        self.assertTrue(directory_synced)
+                        self.assertFalse((self.gate / 'inventory-paused').exists())
+                        self.assertFalse((self.gate / 'inventory-signal').exists())
+
+    def test_crash_before_and_after_pause_unlink(self):
+        for after in (False, True):
+            with self.subTest(after=after):
+                (self.gate / 'inventory-valid').unlink(missing_ok=True)
+                pid = os.fork()
+                if pid == 0:
+                    real_unlink = os.unlink
+                    def crash(path, *args, **kwargs):
+                        if path == 'inventory-paused':
+                            if after:
+                                real_unlink(path, *args, **kwargs)
+                            os._exit(77)
+                        return real_unlink(path, *args, **kwargs)
+                    with patch('os.unlink', side_effect=crash):
+                        self.sync()
+                    os._exit(0)
+                _, status = os.waitpid(pid, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 77)
+                self.assertTrue((self.gate / 'inventory-valid').exists())
+                self.assertEqual((self.gate / 'inventory-paused').exists(), not after)
+                if not after:
+                    self.check_paused_and_recover()
+                else:
+                    with gate.authorize(self.gate, self.identity, single_vps_mvp=True):
+                        pass
+
     def test_failed_policy_write_revokes_before_file_and_retry_converges(self):
         before = self.policy.read_bytes()
         self.transport.return_value = {'total_count': 1, 'repositories': [
