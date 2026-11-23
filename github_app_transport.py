@@ -9,11 +9,13 @@ import subprocess
 import sys
 import time
 
-MAX_REQUEST = 8192
-MAX_RESPONSE = 256 * 1024
+MAX_REQUEST = 1024 * 1024
+# ponytail: 4 MiB bounds all responses; oversized reviews remain ambiguous.
+MAX_RESPONSE = 4 * 1024 * 1024
 TIMEOUT = 15
 _TOKEN = re.compile(r'[\x21-\x7e]{1,4096}\Z')
 _PATH = re.compile(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*\Z')
+_REVIEWS = re.compile(r'(/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*/reviews)(?:\?per_page=10&page=([1-9][0-9]*))?\Z')
 
 
 def _https(method, path, credential, body):
@@ -31,7 +33,7 @@ def _https(method, path, credential, body):
         if len(data) > MAX_RESPONSE:
             raise ValueError('response too large')
         obj = json.loads(data)
-        if not isinstance(obj, dict):
+        if not isinstance(obj, (dict, list)):
             raise ValueError('invalid response')
         return data
     finally:
@@ -106,7 +108,7 @@ def _request(method, path, credential, body=None):
                     raise TimeoutError()
                 time.sleep(min(0.01, remaining))
             result = json.loads(output)
-            if not isinstance(result, dict):
+            if not isinstance(result, (dict, list)):
                 raise ValueError('invalid response')
             return result
         finally:
@@ -141,14 +143,62 @@ def _request(method, path, credential, body=None):
 def installation_transport(jwt, installation_id, body):
     if type(installation_id) is not int or not 0 < installation_id < 2**63:
         raise RuntimeError('GitHub transport failed')
-    return _request('POST', f'/app/installations/{installation_id}/access_tokens', jwt, body)
+    result = _request('POST', f'/app/installations/{installation_id}/access_tokens', jwt, body)
+    if not isinstance(result, dict):
+        raise RuntimeError('GitHub transport failed')
+    return result
 
 
 def read_transport(token, path):
     if (not isinstance(path, str) or not _PATH.fullmatch(path)
             or any(part in ('.', '..') for part in path.split('/'))):
         raise RuntimeError('GitHub transport failed')
-    return _request('GET', path, token)
+    result = _request('GET', path, token)
+    if not isinstance(result, dict):
+        raise RuntimeError('GitHub transport failed')
+    return result
+
+
+def review_list_transport(token, path):
+    match = _REVIEWS.fullmatch(path) if isinstance(path, str) else None
+    if (not match or not match.group(2)
+            or any(part in ('.', '..') for part in path.split('/'))):
+        raise RuntimeError('GitHub transport failed')
+    result = _request('GET', path, token)
+    if not isinstance(result, list) or len(result) > 10 or any(not isinstance(item, dict) for item in result):
+        raise RuntimeError('GitHub transport failed')
+    return result
+
+
+def publish_transport(token, path, body):
+    match = _REVIEWS.fullmatch(path) if isinstance(path, str) else None
+    if (not match or match.group(2) or any(part in ('.', '..') for part in path.split('/'))
+            or not isinstance(body, dict) or set(body) not in ({'commit_id', 'event', 'body'}, {'commit_id', 'event', 'body', 'comments'})
+            or body['event'] != 'COMMENT' or not isinstance(body['commit_id'], str)
+            or not re.fullmatch(r'[0-9a-f]{40}', body['commit_id'])
+            or not isinstance(body['body'], str) or not body['body'].strip()):
+        raise RuntimeError('GitHub transport failed')
+    try:
+        from inline_review import PATH
+        comments = body.get('comments', [])
+        if (type(comments) is not list or len(comments) > 100 or any(
+                type(c) is not dict or set(c) != {'path', 'line', 'side', 'body'}
+                or not isinstance(c['path'], str) or not PATH.fullmatch(c['path'])
+                or type(c['line']) is not int or c['line'] <= 0 or c['side'] != 'RIGHT'
+                or not isinstance(c['body'], str) or not c['body'].strip()
+                or len(c['body'].encode('utf-8')) > 65536 for c in comments)):
+            raise ValueError('invalid comments')
+        if len(body['body'].encode('utf-8')) > 65536 + 128:
+            raise ValueError('body too large')
+        result = _request('POST', path, token, body)
+        if (not isinstance(result, dict) or type(result.get('id')) is not int or result['id'] <= 0
+                or result.get('commit_id') != body['commit_id'] or result.get('body') != body['body']
+                or result.get('state') != 'COMMENTED'):
+            raise ValueError('invalid response')
+        return result
+    except Exception:
+        pass
+    raise RuntimeError('GitHub transport failed') from None
 
 
 if __name__ == '__main__':

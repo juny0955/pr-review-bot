@@ -20,7 +20,7 @@ class AuthTests(unittest.TestCase):
         self.key.chmod(0o600)
         self.now = 1700000000
         self.response = {'token': 'test-secret-token', 'expires_at': '2023-11-14T22:43:20Z',
-                         'permissions': {'pull_requests': 'read'},
+                         'permissions': {'pull_requests': 'read', 'contents': 'read'},
                          'repositories': [{'id': 12, 'full_name': 'owner/repo'}]}
         self.api = Mock(return_value=self.response)
         self.auth = InstallationAuth(123, 456, self.key, {12: 'owner/repo'}, 'read', self.api, clock=lambda: self.now)
@@ -79,7 +79,7 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(json.loads(decode(head)), {'alg': 'RS256', 'typ': 'JWT'})
         self.assertEqual(json.loads(decode(payload)), {'iat': self.now - 60, 'exp': self.now + 540, 'iss': '123'})
         self.assertEqual(installation, 456)
-        self.assertEqual(body, {'repository_ids': [12], 'permissions': {'pull_requests': 'read'}})
+        self.assertEqual(body, {'repository_ids': [12], 'permissions': {'pull_requests': 'read', 'contents': 'read'}})
         public = subprocess.check_output(['openssl', 'pkey', '-in', str(self.key), '-pubout'], stderr=subprocess.DEVNULL, timeout=10)
         pub = Path(self.tmp.name, 'public.pem'); pub.write_bytes(public)
         sig = Path(self.tmp.name, 'sig'); sig.write_bytes(decode(signature))

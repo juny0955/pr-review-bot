@@ -68,7 +68,7 @@ def _read_state(directory, name='state.json'):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
             raise ValueError('unsafe gate state')
         state = json.load(stream)
-    if (not isinstance(state, dict) or set(state) != {'policy', 'approvals', 'revision'}
+    if (not isinstance(state, dict) or set(state) not in ({'policy', 'approvals', 'revision'}, {'policy', 'approvals', 'revision', 'auto_repos'})
             or not isinstance(state['policy'], dict) or not isinstance(state['approvals'], list)
             or not isinstance(state['revision'], str) or not re.fullmatch('[0-9a-f]{32}', state['revision'])):
         raise ValueError('invalid gate evidence')
@@ -78,6 +78,12 @@ def _read_state(directory, name='state.json'):
             raise ValueError('invalid gate policy')
         policy[int(key)] = value
     allowed(policy)
+    auto = state.get('auto_repos', {})
+    if (not isinstance(auto, dict) or any(
+            key not in state['policy'] or state['policy'][key] != value
+            or {'1466550689': 'juny0955/pr-review-bot',
+                '1447840098': 'juny0955/rfsync'}.get(key) != value for key, value in auto.items())):
+        raise ValueError('invalid automatic publication policy')
     for entry in state['approvals']:
         if (not isinstance(entry, list) or len(entry) != 6
                 or type(entry[0]) is not int or entry[0] <= 0
@@ -99,8 +105,8 @@ def gate_snapshot(path):
         return state, _version(state)
 
 
-def update_gate(path, policy, approvals, *, expected=None):
-    """CAS-replace policy and approvals; expected=None permits initial creation only."""
+def update_gate(path, policy, approvals, *, expected=None, auto_repos=None):
+    """CAS-replace state; omitted auto_repos disables automatic publication."""
     # Validate exactly as readers do, before replacing the authoritative state.
     import secrets
     with locked_gate(path) as directory:
@@ -114,7 +120,7 @@ def update_gate(path, policy, approvals, *, expected=None):
         try:
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                json.dump({'policy': policy, 'approvals': approvals, 'revision': secrets.token_hex(16)}, stream, allow_nan=False)
+                json.dump({'policy': policy, 'approvals': approvals, 'auto_repos': {} if auto_repos is None else auto_repos, 'revision': secrets.token_hex(16)}, stream, allow_nan=False)
                 stream.flush()
                 os.fsync(stream.fileno())
             _read_state(directory, name)
@@ -128,9 +134,10 @@ def update_gate(path, policy, approvals, *, expected=None):
 
 
 @contextmanager
-def authorize(path, identity):
+def authorize(path, identity, *, single_vps_mvp=False):
     with locked_gate(path) as directory:
         state = _read_state(directory)
-        if state['policy'].get(str(identity[0])) != identity[1] or identity not in state['approvals']:
+        auto = single_vps_mvp is True and state.get('auto_repos', {}).get(str(identity[0])) == identity[1]
+        if state['policy'].get(str(identity[0])) != identity[1] or (identity not in state['approvals'] and not auto):
             raise ValueError('publication not approved by shared revocation gate')
         yield

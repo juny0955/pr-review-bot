@@ -8,12 +8,73 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from github_app_transport import installation_transport, read_transport, MAX_RESPONSE, MAX_REQUEST, _https
+from github_app_transport import installation_transport, read_transport, publish_transport, review_list_transport, MAX_RESPONSE, MAX_REQUEST, _https
 from github_adapter import GitHubReadOnly
 from github_app_auth import InstallationAuth
 
 
 class TransportTests(unittest.TestCase):
+    def test_publish_and_list_transport_fail_closed(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review'}
+        response = {'id': 1, 'commit_id': 'a' * 40, 'body': 'review', 'state': 'COMMENTED'}
+        with patch('github_app_transport._request', return_value=response) as request:
+            self.assertEqual(publish_transport('fake-token', path, body), response)
+            request.assert_called_once_with('POST', path, 'fake-token', body)
+            for bad in ('https://evil.test' + path, path + '?per_page=100&page=1', '/repos/../repo/pulls/7/reviews'):
+                with self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', bad, body)
+            for bad in ({**body, 'event': 'APPROVE'}, {**body, 'commit_id': 'invalid'}, {**body, 'extra': 1}):
+                with self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', path, bad)
+            for bad in ({}, {**response, 'id': True}, {**response, 'commit_id': 'b' * 40}, {**response, 'state': 'PENDING'}):
+                request.return_value = bad
+                with self.assertRaisesRegex(RuntimeError, '^GitHub transport failed$'):
+                    publish_transport('fake-token', path, body)
+            request.return_value = [{'body': 'review'}]
+            self.assertEqual(review_list_transport('fake-token', path + '?per_page=10&page=1'), request.return_value)
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?page=1')
+            request.return_value = [None]
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=10&page=1')
+            request.return_value = [{}] * 11
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=10&page=1')
+            with self.assertRaises(RuntimeError):
+                review_list_transport('fake-token', path + '?per_page=100&page=1')
+
+    def test_inline_comment_validation_before_post(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review'}
+        comment = {'path': 'src/main.py', 'line': 1, 'side': 'RIGHT', 'body': 'fix this'}
+        response = {'id': 1, 'commit_id': body['commit_id'], 'body': body['body'], 'state': 'COMMENTED'}
+        invalid = [None, {}, 'comments', [comment] * 101]
+        invalid += [[{**comment, 'path': p}] for p in ('', '../x', '/x', 'a//b', 'a b', 1)]
+        invalid += [[{**comment, 'line': n}] for n in (True, 0, -1, 1.5, '1')]
+        invalid += [[{**comment, 'side': s}] for s in ('LEFT', '', None)]
+        invalid += [[{**comment, 'body': b}] for b in ('', '  ', None, 'x' * 65537, '\ud800')]
+        invalid += [[{}, {**comment, 'extra': 1}], [{k: v for k, v in comment.items() if k != 'side'}]]
+        with patch('github_app_transport._request', return_value=response) as request:
+            for comments in invalid:
+                with self.subTest(comments=str(comments)[:100]), self.assertRaises(RuntimeError):
+                    publish_transport('fake-token', path, {**body, 'comments': comments})
+                request.assert_not_called()
+            for comments in ([], [comment], [comment] * 100):
+                self.assertEqual(publish_transport('fake-token', path, {**body, 'comments': comments}), response)
+            self.assertEqual(request.call_count, 3)
+
+    def test_inline_request_preserves_credential_and_size_guards(self):
+        path = '/repos/owner/repo/pulls/7/reviews'
+        comment = {'path': 'a.py', 'line': 1, 'side': 'RIGHT', 'body': 'x' * 20000}
+        body = {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'review', 'comments': [comment]}
+        with patch('github_app_transport.subprocess.Popen') as popen:
+            for token, payload in [('bad\ntoken', body), ('fake-token', {**body, 'comments': [comment] * 100}),
+                                   ('fake-token', {**body, 'body': 'x' * (65536 + 129)})]:
+                with self.assertRaises(RuntimeError):
+                    publish_transport(token, path, payload)
+            popen.assert_not_called()
+
     def connection(self, status=201, data=b'{}'):
         response = Mock(status=status)
         response.read.return_value = data
@@ -70,7 +131,7 @@ class TransportTests(unittest.TestCase):
 
     def test_auth_with_test_key_and_mock_https_pins_repository_and_scope(self):
         response = {'token': 'test-token', 'expires_at': '2023-11-14T22:43:20Z',
-                    'permissions': {'pull_requests': 'read'},
+                    'permissions': {'pull_requests': 'read', 'contents': 'read'},
                     'repositories': [{'id': 12, 'full_name': 'owner/repo'}]}
         original = subprocess.Popen
         def selective(args, **kwargs):
@@ -119,14 +180,14 @@ class TransportTests(unittest.TestCase):
     def test_read_mode_uses_only_explicit_read_auth_and_blocks_git_fallback(self):
         auth = Mock(permission='read')
         auth.token.return_value = ('read-secret', 1)
-        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo'}}}
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': 'a' * 40}, 'base': {'sha': 'b' * 40, 'repo': {'id': 12, 'full_name': 'owner/repo', 'private': False}}}
         with patch('github_adapter.read_transport', return_value=pr) as get, patch('github_adapter._gh_get') as gh, patch('github_adapter._pinned_diff') as git:
             adapter = GitHubReadOnly({12: 'owner/repo'}, auth=auth)
             self.assertEqual(adapter.current('owner/repo', 1)['repo_id'], 12)
             get.assert_called_once_with('read-secret', '/repos/owner/repo/pulls/1')
-            with self.assertRaises(RuntimeError):
-                adapter.diff('owner/repo', 1, 'a' * 40, 'b' * 40)
-            gh.assert_not_called(); git.assert_not_called()
+            adapter.diff('owner/repo', 1, 'a' * 40, 'b' * 40)
+            gh.assert_not_called()
+            git.assert_called_once_with('https://github.com/owner/repo.git', 1, 'a' * 40, 'b' * 40, public_only=True)
         with self.assertRaises(ValueError):
             GitHubReadOnly({12: 'owner/repo'}, auth=Mock(permission='write'))
 

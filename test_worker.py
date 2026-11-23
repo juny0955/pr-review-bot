@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from receiver import create_server
 
@@ -14,6 +15,14 @@ def payload(**changes):
     pr.update(changes)
     return {'action': 'opened', 'number': 1, 'repository': {'id': 123, 'full_name': 'example-owner/example-repo'}, 'pull_request': pr}
 
+def sign_queue(db, delivery, secret):
+    import hashlib
+    import hmac
+    db.execute('CREATE TABLE IF NOT EXISTS webhook_signatures(delivery_id TEXT PRIMARY KEY, signature TEXT NOT NULL)')
+    body = db.execute('SELECT body FROM queue WHERE delivery_id=?', (delivery,)).fetchone()[0]
+    db.execute('INSERT OR REPLACE INTO webhook_signatures VALUES (?,?)',
+               (delivery, 'sha256=' + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()))
+
 class WorkerTest(unittest.TestCase):
     def setUp(self):
         from worker import Worker
@@ -21,17 +30,64 @@ class WorkerTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.db = self.root / 'queue.db'
-        server = create_server('secret', {123: 'example-owner/example-repo'}, str(self.db), 0)
+        with patch('receiver.ThreadingHTTPServer'):
+            server = create_server('secret', {123: 'example-owner/example-repo'}, str(self.db), 0)
         server.server_close()
         self.wiki = self.root / 'wiki'; self.wiki.mkdir()
         (self.wiki / 'guide.md').write_text('Review evidence', encoding='utf8')
         self.gh = FakeGH()
         self.model = FakeModel()
-        self.worker = Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'})
+        self.worker = Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'}, webhook_secret='secret')
 
     def enqueue(self, data=None, delivery='id'):
         with closing(sqlite3.connect(self.db)) as db, db:
             db.execute('INSERT INTO queue(delivery_id, body) VALUES (?,?)', (delivery, json.dumps(data or payload()).encode()))
+            sign_queue(db, delivery, 'secret')
+
+    def test_claim_requires_valid_stored_signature_without_starvation(self):
+        import hashlib
+        import hmac
+        from unittest.mock import Mock
+        from outbox import Outbox
+        body = json.dumps(payload()).encode()
+        signature = 'sha256=' + hmac.new(b'secret', body, hashlib.sha256).hexdigest()
+        with closing(sqlite3.connect(self.db)) as db, db:
+            for delivery in ('missing', 'bad', 'good'):
+                db.execute('INSERT INTO queue(delivery_id,body) VALUES (?,?)', (delivery, body))
+            db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('bad', 'sha256=' + '0' * 64))
+            db.execute('INSERT INTO webhook_signatures VALUES (?,?)', ('good', signature))
+        self.worker.webhook_secret = 'wrong'
+        sender = Mock()
+        self.assertIsNone(self.worker.run_once())
+        self.assertIsNone(Outbox(str(self.db), repos={123: 'example-owner/example-repo'}, webhook_secret='wrong').send_once(sender))
+        sender.assert_not_called()
+        self.assertEqual(self.model.calls, [])
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM work').fetchone()[0], 0)
+        self.worker.webhook_secret = 'secret'
+        self.assertEqual(self.worker.run_once()['status'], 'done')
+        self.assertEqual(len(self.model.calls), 1)
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT delivery_id FROM work').fetchall(), [('good',)])
+
+    def test_retry_requires_signature_and_preserves_attempts(self):
+        now = [100]
+        self.worker.clock = lambda: now[0]
+        self.enqueue()
+        claim = self.worker.claim()
+        self.assertTrue(self.worker.finish(claim[0], claim[2], 'retry', {'status': 'retry'}))
+        now[0] += 30
+        with closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("UPDATE webhook_signatures SET signature='é'")
+            before = db.execute('SELECT * FROM work').fetchall()
+        self.assertIsNone(self.worker.run_once())
+        self.assertEqual(self.model.calls, [])
+        with closing(sqlite3.connect(self.db)) as db, db:
+            self.assertEqual(db.execute('SELECT * FROM work').fetchall(), before)
+            sign_queue(db, 'id', 'secret')
+        self.assertEqual(self.worker.run_once()['status'], 'done')
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT attempts FROM work').fetchone()[0], 2)
 
     def test_invalid_policy_is_retried_not_skipped(self):
         policy = self.root / 'policy.json'
@@ -67,6 +123,44 @@ class WorkerTest(unittest.TestCase):
                 self.model.review = lambda request: review
                 self.enqueue(delivery=str(index))
                 self.assertEqual(self.worker.run_once()['status'], 'retry')
+
+    def test_invalid_json_retries_without_persisting_review_then_succeeds(self):
+        now = [100]
+        self.worker.clock = lambda: now[0]
+        responses = iter(['{"body":"synthetic finding', '{"body":"ok","comments":[]}'])
+        self.model.review = lambda request: next(responses)
+        self.enqueue()
+        self.assertEqual(self.worker.run_once()['status'], 'retry')
+        with closing(sqlite3.connect(self.db)) as db:
+            status, result = db.execute('SELECT status,result FROM work').fetchone()
+            self.assertEqual(status, 'retry')
+            self.assertNotIn('synthetic finding', result)
+        now[0] += 30
+        self.assertEqual(self.worker.run_once()['status'], 'done')
+
+    def test_embedded_incomplete_structured_reviews_retry_without_persisting(self):
+        responses = [
+            'Here is the review:\n{"body":"synthetic incomplete finding',
+            'Here is the review:\n```json\n{"body":"synthetic incomplete finding',
+            'Here is the review:\n```\n{"comments":[{"body":"synthetic incomplete finding',
+            'Here is the review: pr-review-inline-v1:{"body":"synthetic incomplete finding',
+            'Here is the review: "comments": [ synthetic incomplete finding',
+        ]
+        for index, review in enumerate(responses):
+            with self.subTest(review=review):
+                self.model.review = lambda request: review
+                self.enqueue(delivery=str(index))
+                self.assertEqual(self.worker.run_once()['status'], 'retry')
+                with closing(sqlite3.connect(self.db)) as db:
+                    status, result = db.execute('SELECT status,result FROM work WHERE delivery_id=?', (str(index),)).fetchone()
+                    self.assertEqual(status, 'retry')
+                    self.assertNotIn('synthetic incomplete finding', result)
+
+    def test_plain_text_review_with_code_fence_remains_compatible(self):
+        review = '기존 리뷰\n```python\nprint("hello")\n```'
+        self.model.review = lambda request: review
+        self.enqueue()
+        self.assertEqual(self.worker.run_once()['review'], review)
 
     def test_review_is_durable_and_not_repeated(self):
         self.enqueue()
@@ -119,7 +213,7 @@ class WorkerTest(unittest.TestCase):
         self.enqueue(delivery='second')
         self.gh.current = lambda *args: (_ for _ in ()).throw(RuntimeError('secret'))
         self.assertEqual(self.worker.run_once()['status'], 'retry')
-        restarted = Worker(str(self.db), FakeGH(), self.model, self.wiki, {123: 'example-owner/example-repo'}, clock=lambda: now[0])
+        restarted = Worker(str(self.db), FakeGH(), self.model, self.wiki, {123: 'example-owner/example-repo'}, clock=lambda: now[0], webhook_secret='secret')
         self.assertEqual(restarted.claim()[0], 'second')
         self.assertIsNone(restarted.claim())
         now[0] += 30
@@ -184,7 +278,7 @@ class WorkerTest(unittest.TestCase):
         from threading import Barrier
         from worker import Worker
         self.enqueue()
-        workers = [Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'}) for _ in range(8)]
+        workers = [Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'}, webhook_secret='secret') for _ in range(8)]
         barrier = Barrier(len(workers))
         def claim(worker):
             barrier.wait()
@@ -200,8 +294,44 @@ class WorkerTest(unittest.TestCase):
             db.execute('DROP TABLE work')
             db.execute('CREATE TABLE work (delivery_id TEXT PRIMARY KEY, status TEXT NOT NULL, lease_token TEXT, lease_until REAL, attempts INTEGER NOT NULL DEFAULT 0, result TEXT)')
             db.execute("INSERT INTO work(delivery_id,status,attempts) VALUES ('id','retry',1)")
-        worker = Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'}, clock=lambda: 100)
-        self.assertEqual(worker.run_once()['status'], 'done')
+        worker = Worker(str(self.db), self.gh, self.model, self.wiki, {123: 'example-owner/example-repo'}, clock=lambda: 100, webhook_secret='secret')
+        self.assertIsNone(worker.run_once())
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT status,attempts,publish_eligible,notifications_enabled,mode_provenance FROM work').fetchone(),
+                             ('retry', 1, None, None, None))
+
+    def test_ambiguous_retry_and_expired_lease_are_held_for_operator(self):
+        from worker import Worker
+        from unittest.mock import Mock
+        from outbox import Outbox
+        modes = [(None, None), (None, 1), (1, None)]
+        for i, mode in enumerate(modes):
+            for status, attempts in [('retry', 1), ('retry', 3), ('running', 1), ('running', 3), ('done', 1)]:
+                delivery = f'{i}-{status}-{attempts}'
+                self.enqueue(delivery=delivery)
+                with closing(sqlite3.connect(self.db)) as db, db:
+                    db.execute('''INSERT INTO work(delivery_id,status,attempts,lease_token,lease_until,result,
+                        publish_eligible,notifications_enabled) VALUES (?,?,?,?,?,?,?,?)''',
+                        (delivery, status, attempts, 'old', 1, 'original', *mode))
+        with closing(sqlite3.connect(self.db)) as db:
+            before = db.execute('SELECT * FROM work ORDER BY delivery_id').fetchall()
+        for publish in (False, True):
+            for notify in (False, True):
+                worker = Worker(str(self.db), self.gh, self.model, self.wiki,
+                                {123: 'example-owner/example-repo'}, clock=lambda: 100,
+                                publish_eligible=publish, notifications_enabled=notify, webhook_secret='fake')
+                self.assertIsNone(worker.claim())
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute('SELECT * FROM work ORDER BY delivery_id').fetchall(), before)
+        sender = Mock()
+        # Unknown or partial legacy modes cannot emit notifications.
+        box = Outbox(str(self.db), clock=lambda: 100, repos={123: 'example-owner/example-repo'})
+        self.assertIsNone(box.send_once(sender))
+        sender.assert_not_called()
+        self.enqueue(delivery='new')
+        with closing(sqlite3.connect(self.db)) as db, db:
+            sign_queue(db, 'new', 'fake')
+        self.assertEqual(worker.claim()[0], 'new')
 
     def test_wiki_symlink_excluded_and_large_file_chunked(self):
         from worker import wiki_evidence

@@ -14,6 +14,22 @@ def fresh(**overrides):
 
 
 class DirectEntrySafetyTests(unittest.TestCase):
+    def test_secret_patterns_rejected_before_any_side_effect(self):
+        samples = ['-----BEGIN PRIVATE KEY-----', 'ghp_' + 'x' * 36,
+                   'github_pat_' + 'a' * 30, 'AKIA' + 'A' * 16,
+                   'sk-proj-' + 'a' * 30, 'Authorization: Bearer ' + 'x' * 20,
+                   '"api_key": "sample-value"', 'PASSWORD = sample-value']
+        for enabled in (False, True):
+            post, current = Mock(), Mock()
+            publisher = GitHubPublisher(post, current, POLICY, enabled=enabled)
+            for review in samples:
+                with self.subTest(enabled=enabled, review=review):
+                    with self.assertRaisesRegex(ValueError, 'potential secret') as error:
+                        publisher._publish_locked(ID, REPO, 1, SHA, review, 'b' * 40)
+                    self.assertNotIn(review, str(error.exception))
+            post.assert_not_called()
+            current.assert_not_called()
+
     def test_direct_locked_call_cannot_bypass_safety(self):
         import tempfile
         from pathlib import Path
@@ -132,6 +148,42 @@ class LedgerTests(unittest.TestCase):
         gate = patch('publisher._require_revocation_gate')
         gate.start()
         self.addCleanup(gate.stop)
+    def test_inline_review_reaches_mock_github_and_prior_ambiguous_never_reposts(self):
+        from contextlib import closing
+        import json, sqlite3, tempfile
+        from pathlib import Path
+        from github_app_transport import publish_transport, _https
+        from inline_review import prepare_review
+
+        diff = 'diff --git a/src.py b/src.py\n--- a/src.py\n+++ b/src.py\n@@ -1 +1 @@\n-old\n+new\n'
+        review = prepare_review(json.dumps({'body': 'summary', 'comments': [
+            {'path': 'src.py', 'line': 1, 'body': 'fix this'}]}), diff)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ledger'
+            conn = Mock()
+            def accept(method, endpoint, **kwargs):
+                payload = json.loads(kwargs['body'])
+                self.assertEqual(method, 'POST')
+                self.assertEqual(endpoint, '/repos/example-owner/example-repo/pulls/7/reviews')
+                self.assertEqual(payload['comments'], [{'path': 'src.py', 'line': 1, 'side': 'RIGHT', 'body': 'fix this'}])
+                conn.getresponse.return_value.status = 200
+                conn.getresponse.return_value.read.return_value = json.dumps(
+                    {'id': 1, 'commit_id': payload['commit_id'], 'body': payload['body'], 'state': 'COMMENTED'}).encode()
+            conn.request.side_effect = accept
+            def request(method, endpoint, token, body):
+                return json.loads(_https(method, endpoint, token, json.dumps(body)))
+            post = Mock(side_effect=lambda endpoint, payload: publish_transport('fake-token', '/' + endpoint, payload))
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=path, get=Mock(return_value=[]), diff=Mock(return_value=diff))
+            with patch('github_app_transport._request', side_effect=request), patch('github_app_transport.http.client.HTTPSConnection', return_value=conn):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'sent')
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'sent')
+                self.assertEqual(conn.request.call_count, 1)
+                with closing(sqlite3.connect(path)) as db, db:
+                    db.execute("UPDATE publications SET state = 'ambiguous' WHERE marker LIKE '<!--%'")
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, review, base_sha='b' * 40), 'ambiguous')
+                self.assertEqual(conn.request.call_count, 1)
+
     def test_new_claim_blocks_legacy_claim_before_post(self):
         from contextlib import closing
         import hashlib, json, sqlite3, tempfile
@@ -254,6 +306,52 @@ class LedgerTests(unittest.TestCase):
             get.return_value = [{'commit_id': SHA, 'body': body}]
             self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'sent')
             self.assertEqual(post.call_count, 1)
+
+    def test_reconcile_large_paginated_reviews_and_bound(self):
+        import json, tempfile
+        from pathlib import Path
+        from github_app_transport import MAX_RESPONSE, _https, review_list_transport
+
+        with tempfile.TemporaryDirectory() as directory:
+            post = Mock(side_effect=TimeoutError())
+            def request(method, path, token):
+                page = int(path.rsplit('=', 1)[1])
+                items = [{'commit_id': SHA, 'body': 'x' * 60000} for _ in range(10)]
+                if page == 2:
+                    items[0]['body'] = post.call_args.args[1]['body']
+                conn = Mock()
+                conn.getresponse.return_value.status = 200
+                conn.getresponse.return_value.read.return_value = json.dumps(items).encode()
+                with patch('github_app_transport.http.client.HTTPSConnection', return_value=conn):
+                    return json.loads(_https(method, path, token, None))
+            get = lambda path: review_list_transport('fake-token', '/' + path)
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=Path(directory) / 'ledger', get=get)
+            self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            with patch('github_app_transport._request', side_effect=request) as transport:
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'sent')
+                self.assertEqual(transport.call_count, 2)
+                self.assertIn('per_page=10&page=2', transport.call_args.args[1])
+            self.assertEqual(post.call_count, 1)
+            self.assertGreaterEqual(MAX_RESPONSE, 600000)
+
+    def test_reconciliation_budgets_never_repost(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            post = Mock(side_effect=TimeoutError())
+            get = Mock(return_value=[{'body': 'other'}] * 10)
+            publisher = GitHubPublisher(post, Mock(return_value=fresh()), POLICY, enabled=True,
+                                        ledger_path=Path(directory) / 'ledger', get=get)
+            self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            with patch('publisher.time.monotonic', return_value=0):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            self.assertEqual(get.call_count, 3)
+            get.reset_mock()
+            with patch('publisher.time.monotonic', side_effect=[0, 0, 6]):
+                self.assertEqual(publisher.publish(ID, REPO, 7, SHA, 'review', base_sha='b' * 40), 'ambiguous')
+            self.assertEqual(get.call_count, 1)
+            post.assert_called_once()
 
     def test_fails_closed_without_durable_ledger(self):
         post = Mock()

@@ -13,10 +13,23 @@ import json
 import sqlite3
 import uuid
 import re
+import time
 
 from repo_config import allowed
+from inline_review import unpack_review, changed_lines
 
 SHA = re.compile(r'[0-9a-f]{40}\Z')
+MVP_REPOS = {1466550689: 'juny0955/pr-review-bot', 1447840098: 'juny0955/rfsync'}
+# ponytail: known patterns only; use a maintained secret scanner for broader coverage.
+SECRET = re.compile(
+    r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|'
+    r'\b(?:gh[opusr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|'
+    r'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b|'
+    r'\bxox[baprs]-[A-Za-z0-9-]{10,}|'
+    r'\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|'
+    r'''\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|passwd)\b["']?\s*[:=]\s*["']?[^\s"',;]{4,}''',
+    re.IGNORECASE,
+)
 
 
 def _require_operational_isolation():
@@ -24,9 +37,9 @@ def _require_operational_isolation():
     raise ValueError('publication disabled: operational isolation not implemented')
 
 
-def _require_revocation_gate(path, identity):
+def _require_revocation_gate(path, identity, *, single_vps_mvp=False):
     from revocation_gate import authorize
-    return authorize(path, identity)
+    return authorize(path, identity, single_vps_mvp=single_vps_mvp)
 
 
 def _guard_publish(publish_locked):
@@ -40,19 +53,33 @@ def _guard_publish(publish_locked):
             raise ValueError('invalid base SHA')
         if not isinstance(review, str) or not review.strip() or len(review.encode('utf-8')) > 65536:
             raise ValueError('invalid review')
+        if SECRET.search(review):
+            raise ValueError('review contains a potential secret')
+        body, comments = unpack_review(review)
+        try:
+            if (len(comments) > 100 or len(body.encode('utf-8')) > 65536
+                    or any(len(c['body'].encode('utf-8')) > 65536 for c in comments)):
+                raise ValueError('invalid review')
+        except UnicodeEncodeError:
+            raise ValueError('invalid review') from None
+        if SECRET.search(body) or any(SECRET.search(c['body']) for c in comments):
+            raise ValueError('review contains a potential secret')
         if not self.enabled:
             return 'dry_run'
-        _require_operational_isolation()
+        if not self.single_vps_mvp:
+            _require_operational_isolation()
+        elif MVP_REPOS.get(repo_id) != repo:
+            raise ValueError('MVP repository not allowed')
         identity = [repo_id, repo, number, sha, base_sha, hashlib.sha256(review.encode('utf-8')).hexdigest()]
         # ponytail: one global lock serializes all posts; shard only if throughput requires it.
-        with _require_revocation_gate(self.gate_path, identity):
+        with _require_revocation_gate(self.gate_path, identity, single_vps_mvp=self.single_vps_mvp):
             return publish_locked(self, repo_id, repo, number, sha, review, base_sha)
     return guarded
 
 
 class GitHubPublisher:
-    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None, gate_path=None):
-        if type(enabled) is not bool:
+    def __init__(self, post, current, repos, *, enabled=False, ledger_path=None, get=None, gate_path=None, single_vps_mvp=False, diff=None):
+        if type(enabled) is not bool or type(single_vps_mvp) is not bool:
             raise ValueError('enabled must be boolean')
         allowed(repos)
         self.post = post
@@ -62,6 +89,8 @@ class GitHubPublisher:
         self.ledger_path = ledger_path
         self.get = get
         self.gate_path = gate_path
+        self.single_vps_mvp = single_vps_mvp
+        self.diff = diff
 
     def publish(self, repo_id, repo, number, sha, review, *, base_sha=None):
         return self._publish_locked(repo_id, repo, number, sha, review, base_sha)
@@ -74,6 +103,22 @@ class GitHubPublisher:
                 or actual.get('state') != 'open' or actual.get('draft') is not False
                 or actual.get('sha') != sha or actual.get('base_sha') != base_sha or allowed(self.repos).get(repo_id) != repo):
             raise ValueError('stale, ineligible or mismatched pull request')
+        body, comments = unpack_review(review)
+        if comments:
+            try:
+                valid = changed_lines(self.diff(repo, number, sha, base_sha)) if callable(self.diff) else set()
+            except Exception:
+                valid = set()
+            rejected = [c['body'] for c in comments if (c['path'], c['line']) not in valid]
+            comments = [c for c in comments if (c['path'], c['line']) in valid]
+            if rejected:
+                body += '\n\n' + '\n\n'.join(rejected)
+            actual = self.current(repo, number)
+            if (not isinstance(actual, dict) or type(actual.get('repo_id')) is not int
+                    or actual.get('repo_id') != repo_id or actual.get('repo') != repo
+                    or actual.get('state') != 'open' or actual.get('draft') is not False
+                    or actual.get('sha') != sha or actual.get('base_sha') != base_sha):
+                raise ValueError('stale, ineligible or mismatched pull request')
         if (not isinstance(self.ledger_path, (str, os.PathLike)) or not str(self.ledger_path)
                 or str(self.ledger_path) == ':memory:' or str(self.ledger_path).startswith('file:')
                 or not callable(self.get)):
@@ -109,8 +154,13 @@ class GitHubPublisher:
             # A complete positive match is evidence of delivery; absence is not
             # evidence of non-delivery, even if every page was read successfully.
             try:
-                for page in range(1, 1001):
-                    reviews = self.get(f'{endpoint}?per_page=100&page={page}')
+                # ponytail: only the first 30 reviews; deeper markers need operator reconciliation.
+                deadline = time.monotonic() + 5
+                for page in range(1, 4):
+                    # A single injected get must have its own timeout; this budget is between calls.
+                    if time.monotonic() >= deadline:
+                        break
+                    reviews = self.get(f'{endpoint}?per_page=10&page={page}')
                     if not isinstance(reviews, list):
                         return 'ambiguous'
                     for item in reviews:
@@ -120,14 +170,16 @@ class GitHubPublisher:
                             with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db, db:
                                 db.execute("UPDATE publications SET state = 'sent' WHERE key = ?", (key,))
                             return 'sent'
-                    if len(reviews) < 100:
+                    if len(reviews) < 10:
                         break
             except Exception:
                 pass
             return 'ambiguous'
         try:
-            self.post(endpoint, {'commit_id': sha, 'event': 'COMMENT',
-                                 'body': review + '\n\n' + marker})
+            payload = {'commit_id': sha, 'event': 'COMMENT', 'body': body + '\n\n' + marker}
+            if comments:
+                payload['comments'] = comments
+            self.post(endpoint, payload)
         except Exception:
             with closing(sqlite3.connect(self.ledger_path, timeout=30)) as db, db:
                 db.execute("UPDATE publications SET state = 'ambiguous' WHERE key = ? AND state = 'pending'", (key,))

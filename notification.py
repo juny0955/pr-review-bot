@@ -47,7 +47,7 @@ class DiscordTransport:
         request = Request(
             f'https://discord.com/api/v10/channels/{self._channel}/messages',
             data=json.dumps(payload).encode('utf-8'),
-            headers={'Authorization': f'Bot {self._token}', 'Content-Type': 'application/json'},
+            headers={'Authorization': f'Bot {self._token}', 'Content-Type': 'application/json', 'User-Agent': 'PRReviewBot/1.0'},
             method='POST',
         )
         try:

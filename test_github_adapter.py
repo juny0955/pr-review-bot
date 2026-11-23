@@ -12,7 +12,7 @@ class AdapterTests(unittest.TestCase):
     def test_current_rejects_missing_or_mismatched_pr_number(self):
         from unittest.mock import Mock
         pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
-              'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}
+              'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO, 'private': False}}}
         for auth in (None, Mock(permission='read', token=Mock(return_value=('fake', 0)))):
             for number in (None, True, '1', 2, 1):
                 response = dict(pr)
@@ -30,22 +30,106 @@ class AdapterTests(unittest.TestCase):
                         with self.assertRaises(ValueError):
                             adapter.current(REPO, 1)
 
-    def test_app_diff_never_uses_ambient_credentials_or_network(self):
+    def test_app_diff_checks_identity_and_state_before_and_after_fetch(self):
         from unittest.mock import Mock
-        auth = Mock(permission='read')
+        auth = Mock(permission='read', token=Mock(return_value=('fake-token', 0)))
         adapter = GitHubReadOnly({123: REPO}, auth=auth)
-        with patch('github_adapter._pinned_diff') as git, \
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
+              'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO, 'private': False}}}
+        with patch('github_adapter._pinned_diff', return_value='diff') as git, \
              patch('github_adapter._gh_get') as gh, \
-             patch('github_adapter.read_transport') as transport, \
-             patch.object(adapter, 'current') as current:
-            for head, base in ((SHA, 'b' * 40), ('invalid', 'invalid')):
-                with self.subTest(head=head), self.assertRaisesRegex(RuntimeError, '^App-authenticated diff unavailable$'):
-                    adapter.diff(REPO, 1, head, base)
-            auth.token.assert_not_called()
-            git.assert_not_called()
+             patch('github_adapter.read_transport', return_value=pr) as transport:
+            self.assertEqual(adapter.diff(REPO, 1, SHA, 'b' * 40), 'diff')
+            self.assertEqual(transport.call_count, 2)
+            git.assert_called_once_with('https://github.com/' + REPO + '.git', 1, SHA, 'b' * 40, public_only=True)
+            self.assertEqual(auth.token.call_count, 2)
             gh.assert_not_called()
-            transport.assert_not_called()
-            current.assert_not_called()
+            for changed in (dict(pr, state='closed'), dict(pr, draft=True),
+                            dict(pr, head={'sha': 'c' * 40}),
+                            dict(pr, base={'sha': 'b' * 40, 'repo': {'id': 124, 'full_name': REPO}})):
+                transport.side_effect = [pr, changed]
+                with self.assertRaises(ValueError):
+                    adapter.diff(REPO, 1, SHA, 'b' * 40)
+
+    def test_app_git_credentials_are_isolated_and_redirects_disabled(self):
+        import os
+        from github_adapter import _pinned_diff
+        with patch.dict(os.environ, {'GH_TOKEN': 'ambient', 'GITHUB_TOKEN': 'ambient', 'HTTPS_PROXY': 'http://evil',
+                                     'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'http.extraheader'}, clear=True), \
+             patch('github_adapter._bounded_git_root', return_value='/dev/shm'), \
+             patch('github_adapter.subprocess.Popen', side_effect=OSError('stop')) as popen:
+            with self.assertRaises(OSError):
+                _pinned_diff('https://github.com/' + REPO + '.git', 1, SHA, 'b' * 40, public_only=True)
+            args, env = popen.call_args.args[0], popen.call_args.kwargs['env']
+            self.assertIn('http.followRedirects=false', args)
+            self.assertNotIn('credential.helper=!gh auth git-credential', args)
+            self.assertNotIn('fake-token', ' '.join(args))
+            self.assertNotIn('GH_TOKEN', env)
+            self.assertNotIn('GITHUB_TOKEN', env)
+            for name in ('GH_CONFIG_DIR', 'HTTPS_PROXY', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0'):
+                self.assertNotIn(name, env)
+            self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
+            self.assertIn('credential.helper=', args)
+
+    def test_app_public_only_fails_closed_and_rechecks_visibility(self):
+        from unittest.mock import Mock
+        auth = Mock(permission='read', token=Mock(return_value=('fake-token', 0)))
+        adapter = GitHubReadOnly({123: REPO}, auth=auth)
+        repo = {'id': 123, 'full_name': REPO, 'private': False}
+        pr = {'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
+              'base': {'sha': 'b' * 40, 'repo': repo}}
+        with patch('github_adapter.read_transport') as transport, patch('github_adapter._pinned_diff') as git:
+            for value in (True, None, 0, 'false'):
+                transport.return_value = dict(pr, base={'sha': 'b' * 40, 'repo': dict(repo, private=value)})
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'public repository'):
+                    adapter.diff(REPO, 1, SHA, 'b' * 40)
+                git.assert_not_called()
+            changed = dict(pr, base={'sha': 'b' * 40, 'repo': dict(repo, private=True)})
+            transport.side_effect = [pr, changed]
+            with self.assertRaisesRegex(ValueError, 'changed during fetch'):
+                adapter.diff(REPO, 1, SHA, 'b' * 40)
+
+    def test_public_git_synthetic_local_fetch_all_children_isolated(self):
+        import base64
+        import os
+        import subprocess
+        import tempfile
+        from github_adapter import _pinned_diff
+        with tempfile.TemporaryDirectory() as d:
+            env = {'PATH': os.defpath, 'HOME': d, 'GIT_CONFIG_NOSYSTEM': '1',
+                   'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.invalid',
+                   'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.invalid'}
+            def git(*args, data=None):
+                return subprocess.check_output(['git', '-C', d, *args], input=data, env=env, stderr=subprocess.DEVNULL).decode().strip()
+            git('init', '-q')
+            blob = git('hash-object', '-w', '--stdin', data=b'root\n')
+            tree = git('mktree', data=f'100644 blob {blob}\tfile\n'.encode())
+            base = git('commit-tree', tree, data=b'base\n')
+            blob = git('hash-object', '-w', '--stdin', data=b'root\nfeature\n')
+            tree = git('mktree', data=f'100644 blob {blob}\tfile\n'.encode())
+            head = git('commit-tree', tree, '-p', base, data=b'head\n')
+            git('update-ref', 'refs/pull/1/head', head)
+            original = subprocess.Popen
+            calls = []
+            def launch(*args, **kwargs):
+                calls.append((args[0], kwargs['env'].copy()))
+                return original(*args, **kwargs)
+            with patch.dict(os.environ, {'GH_TOKEN': 'fake-token', 'HTTPS_PROXY': 'http://invalid',
+                                         'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'http.extraheader',
+                                         'GIT_CONFIG_VALUE_0': 'secret'}, clear=True), \
+                 patch('github_adapter._bounded_git_root', return_value='/dev/shm'), \
+                 patch('github_adapter.subprocess.Popen', side_effect=launch):
+                result = _pinned_diff(d, 1, head, base, public_only=True)
+            self.assertIn('+feature', result)
+            self.assertGreaterEqual(len(calls), 6)
+            for args, child_env in calls:
+                self.assertNotIn('fake-token', str((args, child_env)))
+                self.assertNotIn(base64.b64encode(b'x-access-token:fake-token').decode(), str((args, child_env)))
+                self.assertNotIn('HTTPS_PROXY', child_env)
+                self.assertNotIn('GIT_CONFIG_COUNT', child_env)
+                self.assertNotIn('GH_CONFIG_DIR', child_env)
+                self.assertNotIn('credential.helper=!gh auth git-credential', args)
+                self.assertIn('http.followRedirects=false', args)
 
     def test_real_dedicated_mount_is_accepted(self):
         import os
@@ -202,7 +286,7 @@ class AdapterTests(unittest.TestCase):
         from unittest.mock import Mock
         from publisher import GitHubPublisher
         pr = json.dumps({'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA},
-                         'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
+                         'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO, 'private': False}}}).encode()
         # Exercise the dormant publisher path with fake transports only.
         with tempfile.TemporaryDirectory() as directory, patch('github_adapter._gh_get', return_value=pr), \
              patch('publisher._require_revocation_gate'), patch('publisher._require_operational_isolation'):
@@ -254,7 +338,7 @@ class AdapterTests(unittest.TestCase):
             get.assert_not_called()
 
     def test_current_reads_pr_metadata(self):
-        pr = json.dumps({'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO}}}).encode()
+        pr = json.dumps({'number': 1, 'state': 'open', 'draft': False, 'head': {'sha': SHA}, 'base': {'sha': 'b' * 40, 'repo': {'id': 123, 'full_name': REPO, 'private': False}}}).encode()
         with patch('github_adapter._gh_get', return_value=pr) as get:
             gh = GitHubReadOnly({123: REPO})
             self.assertEqual(gh.current(REPO, 1)['sha'], SHA)

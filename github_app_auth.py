@@ -81,6 +81,8 @@ class InstallationAuth:
                 or not now - 60 <= current < now + 540):
             raise ValueError('expired JWT or invalid clock')
         permissions = {'pull_requests': self.permission}
+        if self.permission == 'read':
+            permissions['contents'] = 'read'
         if allowed(self.repos).get(repo_id) != repo:
             raise ValueError('repository not allowed')
         response = self.transport(jwt, self.installation_id,
@@ -97,9 +99,9 @@ class InstallationAuth:
                 or not current + 60 < expiry <= current + 3600):
             raise ValueError('invalid expiry')
         actual = response.get('permissions')
-        if not isinstance(actual, dict) or actual.get('pull_requests') != self.permission:
+        if not isinstance(actual, dict) or any(actual.get(k) != v for k, v in permissions.items()):
             raise ValueError('invalid permissions')
-        if any(k not in ('pull_requests', 'metadata') or (k == 'metadata' and v != 'read') for k, v in actual.items()):
+        if any(k not in (*permissions, 'metadata') or (k == 'metadata' and v != 'read') for k, v in actual.items()):
             raise ValueError('excess permissions')
         repositories = response.get('repositories')
         if (not isinstance(repositories, list) or len(repositories) != 1
