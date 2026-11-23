@@ -41,6 +41,14 @@ class InstallationAuth:
             pass
         raise RuntimeError('authentication failed') from None
 
+    def inventory_token(self):
+        """Issue an installation-wide token restricted to metadata read."""
+        try:
+            return self._token(None, None)
+        except Exception:
+            pass
+        raise RuntimeError('authentication failed') from None
+
     def _token(self, repo_id, repo):
         fd = os.open(self.key_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
         try:
@@ -80,13 +88,17 @@ class InstallationAuth:
         if (type(current) not in (int, float) or not math.isfinite(current)
                 or not now - 60 <= current < now + 540):
             raise ValueError('expired JWT or invalid clock')
-        permissions = {'pull_requests': self.permission}
-        if self.permission == 'read':
-            permissions['contents'] = 'read'
-        if allowed(self.repos).get(repo_id) != repo:
-            raise ValueError('repository not allowed')
-        response = self.transport(jwt, self.installation_id,
-                                  {'repository_ids': [repo_id], 'permissions': permissions.copy()})
+        if repo_id is None:
+            permissions = {'metadata': 'read'}
+            body = {'permissions': permissions.copy()}
+        else:
+            permissions = {'pull_requests': self.permission}
+            if self.permission == 'read':
+                permissions['contents'] = 'read'
+            if allowed(self.repos).get(repo_id) != repo:
+                raise ValueError('repository not allowed')
+            body = {'repository_ids': [repo_id], 'permissions': permissions.copy()}
+        response = self.transport(jwt, self.installation_id, body)
         if not isinstance(response, dict):
             raise ValueError('invalid response')
         token, expires = response.get('token'), response.get('expires_at')
@@ -104,7 +116,10 @@ class InstallationAuth:
         if any(k not in (*permissions, 'metadata') or (k == 'metadata' and v != 'read') for k, v in actual.items()):
             raise ValueError('excess permissions')
         repositories = response.get('repositories')
-        if (not isinstance(repositories, list) or len(repositories) != 1
+        if repo_id is None:
+            if 'repositories' in response:
+                raise ValueError('invalid installation scope')
+        elif (not isinstance(repositories, list) or len(repositories) != 1
                 or not isinstance(repositories[0], dict) or type(repositories[0].get('id')) is not int
                 or repositories[0].get('id') != repo_id or repositories[0].get('full_name') != repo):
             raise ValueError('invalid repository scope')

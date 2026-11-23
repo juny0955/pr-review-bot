@@ -80,9 +80,7 @@ def _read_state(directory, name='state.json'):
     allowed(policy)
     auto = state.get('auto_repos', {})
     if (not isinstance(auto, dict) or any(
-            key not in state['policy'] or state['policy'][key] != value
-            or {'1466550689': 'juny0955/pr-review-bot',
-                '1447840098': 'juny0955/rfsync'}.get(key) != value for key, value in auto.items())):
+            key not in state['policy'] or state['policy'][key] != value for key, value in auto.items())):
         raise ValueError('invalid automatic publication policy')
     for entry in state['approvals']:
         if (not isinstance(entry, list) or len(entry) != 6
@@ -105,10 +103,27 @@ def gate_snapshot(path):
         return state, _version(state)
 
 
+def _write_state(directory, policy, approvals, auto_repos):
+    import secrets
+    name = '.state-' + secrets.token_hex(16)
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump({'policy': policy, 'approvals': approvals, 'auto_repos': auto_repos, 'revision': secrets.token_hex(16)}, stream, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _read_state(directory, name)
+        os.replace(name, 'state.json', src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
 def update_gate(path, policy, approvals, *, expected=None, auto_repos=None):
     """CAS-replace state; omitted auto_repos disables automatic publication."""
-    # Validate exactly as readers do, before replacing the authoritative state.
-    import secrets
     with locked_gate(path) as directory:
         try:
             old = _read_state(directory)
@@ -116,26 +131,31 @@ def update_gate(path, policy, approvals, *, expected=None, auto_repos=None):
             old = None
         if (old is None and expected is not None) or (old is not None and expected != _version(old)):
             raise ValueError('gate state conflict')
-        name = '.state-' + secrets.token_hex(16)
-        try:
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-                json.dump({'policy': policy, 'approvals': approvals, 'auto_repos': {} if auto_repos is None else auto_repos, 'revision': secrets.token_hex(16)}, stream, allow_nan=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            _read_state(directory, name)
-            os.replace(name, 'state.json', src_dir_fd=directory, dst_dir_fd=directory)
-            os.fsync(directory)
-        finally:
-            try:
-                os.unlink(name, dir_fd=directory)
-            except FileNotFoundError:
-                pass
+        _write_state(directory, policy, approvals, {} if auto_repos is None else auto_repos)
 
 
 @contextmanager
 def authorize(path, identity, *, single_vps_mvp=False):
     with locked_gate(path) as directory:
+        for marker in ('inventory-paused', 'inventory-signal'):
+            try:
+                os.stat(marker, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError('installation inventory synchronization paused')
+        try:
+            fd = os.open('inventory-valid', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            pass  # Legacy gates are not managed by installation sync.
+        else:
+            with os.fdopen(fd) as validity:
+                info = os.fstat(validity.fileno())
+                value = validity.read(32)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                        or info.st_mode & 0o077 or not re.fullmatch('[0-9]{1,16}', value)
+                        or not 0 <= time.time() - int(value) <= 120):
+                    raise ValueError('installation inventory expired')
         state = _read_state(directory)
         auto = single_vps_mvp is True and state.get('auto_repos', {}).get(str(identity[0])) == identity[1]
         if state['policy'].get(str(identity[0])) != identity[1] or (identity not in state['approvals'] and not auto):

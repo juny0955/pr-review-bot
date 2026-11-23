@@ -38,11 +38,8 @@ class MVPTests(unittest.TestCase):
                 with authorize(gate, identity, single_vps_mvp=True): pass
                 with self.assertRaises(ValueError):
                     with authorize(gate, identity): pass
-            for key, name in [('1466550689', 'juny0955/rfsync'),
-                              ('1447840098', REPO), ('123', REPO),
-                              ('1447840098', 'other/repo')]:
-                with self.subTest(key=key, name=name), self.assertRaises(ValueError):
-                    update_gate(gate, {key: name}, [], auto_repos={key: name}, expected=gate_snapshot(gate)[1])
+            with self.assertRaises(ValueError):
+                update_gate(gate, pairs, [], auto_repos={'123': REPO}, expected=gate_snapshot(gate)[1])
             update_gate(gate, pairs, [], auto_repos={'1466550689': REPO}, expected=gate_snapshot(gate)[1])
             with self.assertRaises(ValueError):
                 with authorize(gate, [1447840098, pairs['1447840098'], 7, HEAD, BASE, 'c' * 64], single_vps_mvp=True): pass

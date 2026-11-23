@@ -1,4 +1,4 @@
-"""Local-only GitHub pull request webhook intake; no outbound operations.
+"""Local GitHub webhook intake; optional installation inventory sync is outbound.
 
 Queue entries are never automatically evicted; saturation returns 503.
 Offline retention may replace eligible results with permanent SHA-256 tombstones.
@@ -14,6 +14,8 @@ import os
 import re
 import sqlite3
 import stat
+import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from repo_config import allowed
 from outbox import Outbox, valid_identity
@@ -22,9 +24,14 @@ MAX_BODY = 1024 * 1024
 MAX_QUEUE = 1000
 
 
-def create_server(secret, allowed_repos, db_path, port=8080):
+def create_server(secret, allowed_repos, db_path, port=8080, *, installation_id=None, sync_inventory=None, invalidate_inventory=None):
     if not secret or not allowed_repos:
         raise ValueError('secret and repository allowlist are required')
+    if installation_id is not None and (type(installation_id) is not int or not 0 < installation_id < 2**63):
+        raise ValueError('invalid installation ID')
+    if sync_inventory is not None and (installation_id is None or not callable(sync_inventory)):
+        raise ValueError('inventory sync requires a pinned installation')
+    sync_lock = threading.Lock()
     key = secret.encode('utf-8')
     allowed(allowed_repos)
     fd = os.open(db_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
@@ -39,6 +46,8 @@ def create_server(secret, allowed_repos, db_path, port=8080):
         db.execute('CREATE TABLE IF NOT EXISTS tombstone (delivery_id TEXT PRIMARY KEY, body_hash BLOB NOT NULL)')
         db.execute('CREATE TABLE IF NOT EXISTS webhook_signatures (delivery_id TEXT PRIMARY KEY, signature TEXT NOT NULL)')
         db.execute('CREATE INDEX IF NOT EXISTS tombstone_body_hash ON tombstone(body_hash)')
+        db.execute('CREATE TABLE IF NOT EXISTS webhook_semantic (event_key BLOB PRIMARY KEY)')
+        db.execute('CREATE TABLE IF NOT EXISTS webhook_alias (delivery_id TEXT PRIMARY KEY, body_hash BLOB NOT NULL)')
 
     Outbox(db_path, repos=allowed_repos)
 
@@ -84,17 +93,44 @@ def create_server(secret, allowed_repos, db_path, port=8080):
             delivery = self.headers['X-GitHub-Delivery']
             if not re.fullmatch(r'[A-Za-z0-9-]{1,128}', delivery):
                 return self.reply(400, 'invalid delivery')
-            if self.headers['X-GitHub-Event'] != 'pull_request':
+            event = self.headers['X-GitHub-Event']
+            if event not in ('pull_request', 'installation', 'installation_repositories'):
                 return self.reply(400, 'unsupported event')
             try:
                 payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    return self.reply(400, 'invalid payload')
+                # ponytail: missing installation is indistinguishable from a legacy hook with the same secret.
+                if installation_id is not None and 'installation' in payload:
+                    installation = payload['installation']
+                    if (not isinstance(installation, dict) or type(installation.get('id')) is not int
+                            or installation['id'] != installation_id):
+                        return self.reply(403, 'installation not allowed')
+                if event != 'pull_request':
+                    if installation_id is None or 'installation' not in payload:
+                        return self.reply(403, 'installation not allowed')
+                    if not isinstance(payload.get('action'), str) or not payload['action']:
+                        return self.reply(400, 'invalid payload')
+                    if sync_inventory is None:
+                        return self.reply(503, 'inventory sync unavailable')
+                    try:
+                        signal = invalidate_inventory() if invalidate_inventory is not None else None
+                        with sync_lock:
+                            if signal is None:
+                                sync_inventory()
+                            else:
+                                sync_inventory(signal=signal)
+                    except Exception:
+                        return self.reply(503, 'inventory sync unavailable')
+                    return self.reply(200, 'inventory synced')
                 repo = payload['repository']['full_name']
                 repo_id = payload['repository'].get('id')
                 try:
                     policy = allowed(allowed_repos)
                 except (OSError, ValueError, TypeError):
                     return self.reply(503, 'repository configuration unavailable')
-                if type(repo_id) is not int or policy.get(repo_id) != repo:
+                if (type(repo_id) is not int or not isinstance(repo, str)
+                        or (policy.get(repo_id) != repo and (sync_inventory is None or 'installation' not in payload))):
                     return self.reply(403, 'repository not allowed')
                 action = payload['action']
                 number = payload['number']
@@ -106,6 +142,24 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                     or type(pr['draft']) is not bool or pr['state'] not in ('open', 'closed')
                     or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha)):
                     return self.reply(400, 'invalid payload')
+                if policy.get(repo_id) != repo:
+                    if sync_inventory is None or 'installation' not in payload:
+                        return self.reply(403, 'repository not allowed')
+                    try:
+                        with sync_lock:
+                            snapshot = sync_inventory()
+                            policy = allowed(allowed_repos)
+                    except Exception:
+                        return self.reply(503, 'inventory sync unavailable')
+                    if not isinstance(snapshot, dict) or snapshot.get(repo_id) != repo or policy.get(repo_id) != repo:
+                        return self.reply(403, 'repository not allowed')
+                # ponytail: incomplete legacy payloads use exact-body deduplication.
+                event_key = None
+                base = pr.get('base', {}).get('sha') if isinstance(pr.get('base'), dict) else None
+                updated = pr.get('updated_at')
+                if isinstance(base, str) and re.fullmatch(r'[0-9a-f]{40}', base) and isinstance(updated, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', updated):
+                    datetime.strptime(updated, '%Y-%m-%dT%H:%M:%SZ')
+                    event_key = hashlib.sha256(json.dumps([repo_id, number, action, sha, base, pr['state'], pr['draft'], updated], separators=(',', ':')).encode()).digest()
             except (ValueError, KeyError, TypeError, RecursionError):
                 return self.reply(400, 'invalid payload')
             try:
@@ -115,18 +169,25 @@ def create_server(secret, allowed_repos, db_path, port=8080):
                     if previous is not None:
                         return self.reply(200 if previous[0] == body else 409, 'duplicate' if previous[0] == body else 'delivery conflict')
                     digest = hashlib.sha256(body).digest()
+                    previous = db.execute('SELECT body_hash FROM webhook_alias WHERE delivery_id=?', (delivery,)).fetchone()
+                    if previous is not None:
+                        return self.reply(200 if previous[0] == digest else 409, 'duplicate' if previous[0] == digest else 'delivery conflict')
                     previous = db.execute('SELECT body_hash FROM tombstone WHERE delivery_id=?', (delivery,)).fetchone()
                     if previous is not None:
                         return self.reply(200 if previous[0] == digest else 409, 'duplicate' if previous[0] == digest else 'delivery conflict')
-                    if db.execute('SELECT 1 FROM queue WHERE body = ? LIMIT 1', (body,)).fetchone():
-                        return self.reply(200, 'duplicate')
-                    if db.execute('SELECT 1 FROM tombstone WHERE body_hash=? LIMIT 1', (digest,)).fetchone():
+                    if (db.execute('SELECT 1 FROM queue WHERE body = ? LIMIT 1', (body,)).fetchone()
+                            or db.execute('SELECT 1 FROM tombstone WHERE body_hash=? LIMIT 1', (digest,)).fetchone()
+                            or (event_key is not None and db.execute('SELECT 1 FROM webhook_semantic WHERE event_key=?', (event_key,)).fetchone())):
+                        db.execute('INSERT INTO webhook_alias VALUES (?, ?)', (delivery, digest))
+                        db.commit()
                         return self.reply(200, 'duplicate')
                     if db.execute('SELECT COUNT(*) FROM queue').fetchone()[0] >= MAX_QUEUE:
                         # ponytail: retain every row; only offline retention may delete.
                         raise sqlite3.OperationalError('queue full')
                     db.execute('INSERT INTO queue (delivery_id, body) VALUES (?, ?)', (delivery, body))
                     db.execute('INSERT INTO webhook_signatures VALUES (?, ?)', (delivery, signature))
+                    if event_key is not None:
+                        db.execute('INSERT INTO webhook_semantic VALUES (?)', (event_key,))
                     db.execute("UPDATE outbox SET repo_id=?,repo_name=?,pr_number=? WHERE delivery_id=? AND event='detected'", (repo_id, repo, number, delivery))
                 return self.reply(202, 'queued')
             except sqlite3.Error:
@@ -140,7 +201,22 @@ def main():
     repos = os.environ.get('REPO_CONFIG', 'repos.json')
     db = os.environ.get('QUEUE_DB', 'queue.sqlite3')
     port = int(os.environ.get('PORT', '8080'))
-    server = create_server(secret, repos, db, port)
+    installation = os.environ.get('GITHUB_APP_INSTALLATION_ID')
+    if installation is not None:
+        if not re.fullmatch(r'[0-9]{1,19}', installation):
+            raise ValueError('invalid installation ID')
+        installation = int(installation)
+    sync = None
+    invalidate = None
+    gate = os.environ.get('PUBLICATION_GATE')
+    if gate:
+        from github_adapter import app_read_auth
+        from github_app_transport import inventory_transport
+        from installation_inventory import sync_installation, invalidate_inventory
+        auth = app_read_auth(repos)
+        sync = lambda *, signal=None: sync_installation(auth, inventory_transport, gate, repos, signal=signal)
+        invalidate = lambda: invalidate_inventory(gate)
+    server = create_server(secret, repos, db, port, installation_id=installation, sync_inventory=sync, invalidate_inventory=invalidate)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

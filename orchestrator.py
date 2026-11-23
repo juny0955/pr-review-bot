@@ -16,9 +16,9 @@ from outbox import Outbox
 from repo_config import allowed
 from worker import Worker
 from publish_worker import publish_worker_result
-from publisher import MVP_REPOS
 from github_app_auth import InstallationAuth
-from github_app_transport import installation_transport, publish_transport, review_list_transport
+from github_app_transport import installation_transport, inventory_transport, publish_transport, review_list_transport
+from installation_inventory import reconcile_installation, SyncSuperseded
 
 
 def _status(value):
@@ -40,6 +40,18 @@ def notification_loop(outbox, notifier, channel, stop, *, poll_interval=5):
             result = None
         if result is None:
             stop.wait(poll_interval)
+
+
+def inventory_loop(auth, gate, repos, stop, poll_interval=60):
+    while not stop.wait(poll_interval):
+        try:
+            reconcile_installation(auth, inventory_transport, gate, repos)
+        except SyncSuperseded:
+            continue
+        except Exception:
+            _status('inventory_error')
+            stop.set()
+            return
 
 
 def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_interval=5):
@@ -148,11 +160,14 @@ def main(argv=None):
     parser.add_argument('--single-vps-publish', action='store_true')
     parser.add_argument('--publication-ledger')
     parser.add_argument('--publication-gate')
+    parser.add_argument('--sync-installation', action='store_true', help='sync public installation repositories at startup and every 60 seconds')
     args = parser.parse_args(argv)
     if not ((args.dry_run != args.single_vps_publish) and args.enable_direct_inference and args.authorize_wiki_transfer):
         parser.error('select dry run or single VPS publication and authorize inference')
     if args.single_vps_publish and not (args.github_app_read and args.publication_ledger and args.publication_gate and os.environ.get('WEBHOOK_SECRET')):
         parser.error('publication configuration incomplete')
+    if args.sync_installation and not (args.github_app_read and args.publication_gate):
+        parser.error('installation sync requires App read and a gate')
     try:
         if not os.environ.get('WEBHOOK_SECRET'):
             raise ValueError('webhook secret required')
@@ -161,8 +176,8 @@ def main(argv=None):
         if db.is_symlink() or not db.is_file():
             raise ValueError('existing queue database required')
         repos = allowed(args.repos)
-        if args.single_vps_publish and (not repos or any(MVP_REPOS.get(i) != name for i, name in repos.items())):
-            raise ValueError('experimental repository only')
+        if args.single_vps_publish and not repos and not args.sync_installation:
+            raise ValueError('at least one repository required')
         notifier = channel = None
         if args.enable_discord_notifications:
             channel = os.environ.get('DISCORD_CHANNEL_ID')
@@ -170,6 +185,11 @@ def main(argv=None):
             notifier = DiscordNotifier([channel], transport, enabled=True)
         github = (GitHubReadOnly(args.repos, auth=app_read_auth(args.repos))
                   if args.github_app_read else GitHubReadOnly(args.repos))
+        if args.sync_installation:
+            try:
+                reconcile_installation(github.auth, inventory_transport, args.publication_gate, args.repos)
+            except SyncSuperseded:
+                pass  # The periodic reconciler retries; the gate remains paused.
         publish_auth = None
         if args.single_vps_publish:
             read_auth = github.auth
@@ -191,6 +211,11 @@ def main(argv=None):
                 previous[sig] = signal.signal(sig, request_stop)
             started = []
             try:
+                if args.sync_installation:
+                    inventory_thread = threading.Thread(target=inventory_loop,
+                        args=(github.auth, args.publication_gate, args.repos, stop))
+                    inventory_thread.start()
+                    started.append(inventory_thread)
                 if notifier is not None:
                     thread = threading.Thread(target=notification_loop,
                                               args=(Outbox(str(db), repos=args.repos, webhook_secret=os.environ.get('WEBHOOK_SECRET')), notifier, channel, stop))

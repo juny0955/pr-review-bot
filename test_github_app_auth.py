@@ -11,6 +11,29 @@ from unittest.mock import Mock, patch
 from github_app_auth import InstallationAuth
 
 
+class InventoryTokenTests(unittest.TestCase):
+    def test_metadata_only_installation_scope_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp, 'key'); key.write_bytes(b'mock'); key.chmod(0o600)
+            response = {'token': 'inventory-token', 'expires_at': '2023-11-14T22:43:20Z',
+                        'permissions': {'metadata': 'read'}}
+            api = Mock(return_value=response)
+            auth = InstallationAuth(123, 456, key, {12: 'owner/repo'}, 'read', api, clock=lambda: 1700000000)
+            def rsa(args, **kwargs):
+                output = b'Modulus=' + b'F' * 512 + b'\n' if '-modulus' in args else b'x' * 256
+                return subprocess.CompletedProcess(args, 0, output)
+            with patch('github_app_auth.subprocess.run', side_effect=rsa):
+                self.assertEqual(auth.inventory_token(), ('inventory-token', 1700001800))
+                self.assertEqual(api.call_args.args[2], {'permissions': {'metadata': 'read'}})
+                for change in ({'permissions': {'metadata': 'write'}},
+                               {'permissions': {'metadata': 'read', 'contents': 'read'}},
+                               {'repositories': [{'id': 12, 'full_name': 'owner/repo'}]},
+                               {'expires_at': '2023-11-14T22:13:20Z'}):
+                    api.return_value = dict(response, **change)
+                    with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, '^authentication failed$'):
+                        auth.inventory_token()
+
+
 class AuthTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
