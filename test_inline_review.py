@@ -18,6 +18,50 @@ index 1234567..7654321 100644
 '''
 
 class InlineReviewTest(unittest.TestCase):
+    def test_multiline_end_to_end_and_diff_revalidation(self):
+        from github_app_transport import publish_transport
+        item = {'path': 'src/a.py', 'start_line': 2, 'line': 3, 'body': '오류'}
+        review = prepare_review(json.dumps({'body': '요약', 'comments': [item]}), DIFF)
+        expected = {**item, 'start_side': 'RIGHT', 'side': 'RIGHT'}
+        self.assertEqual(unpack_review(review)[1], [expected])
+        repo, ident, sha, base = 'juny0955/pr-review-bot', 1466550689, 'a' * 40, 'b' * 40
+        state = {'repo_id': ident, 'repo': repo, 'state': 'open', 'draft': False, 'sha': sha, 'base_sha': base}
+        request = Mock(side_effect=lambda method, path, token, payload: {
+            'id': 1, 'commit_id': payload['commit_id'], 'body': payload['body'], 'state': 'COMMENTED'})
+        post = Mock(side_effect=lambda path, payload: publish_transport('token', '/' + path, payload))
+        with tempfile.TemporaryDirectory() as d, patch('publisher._require_revocation_gate', return_value=nullcontext()), patch('github_app_transport._request', request):
+            pub = GitHubPublisher(post, Mock(return_value=state), {ident: repo}, enabled=True,
+                                  single_vps_mvp=True, ledger_path=d + '/ledger', get=Mock(return_value=[]), diff=Mock(return_value=DIFF))
+            self.assertEqual(pub.publish(ident, repo, 1, sha, review, base_sha=base), 'sent')
+            self.assertEqual(request.call_args.args[3]['comments'], [expected])
+            pub.ledger_path = d + '/other'
+            pub.diff = Mock(return_value=DIFF.replace('+added', ' added').replace('@@ -1,2 +1,3 @@', '@@ -1,3 +1,3 @@'))
+            self.assertEqual(pub.publish(ident, repo, 1, sha, review, base_sha=base), 'sent')
+            self.assertNotIn('comments', request.call_args.args[3])
+            self.assertIn('오류', request.call_args.args[3]['body'])
+
+    def test_multiline_rejects_invalid_ranges_and_sides(self):
+        from github_app_transport import publish_transport
+        from inline_review import PREFIX
+        diff = ('diff --git a/a b/a\n--- a/a\n+++ b/a\n'
+                '@@ -1,1 +1,3 @@\n+one\n context\n+three\n'
+                '@@ -5,0 +7,1 @@\n+seven\n')
+        for start, end in [(1, 3), (3, 7), (3, 3), (3, 1), (0, 3), (True, 3), (1, 10**20)]:
+            with self.subTest(start=start, end=end):
+                item = {'path': 'a', 'start_line': start, 'line': end, 'body': 'finding'}
+                body, comments = unpack_review(prepare_review(json.dumps({'body': 'summary', 'comments': [item]}), diff))
+                self.assertEqual(comments, [])
+                self.assertIn('finding', body)
+        good = {'path': 'a', 'start_line': 1, 'start_side': 'RIGHT', 'line': 3, 'side': 'RIGHT', 'body': 'finding'}
+        for change in ({'start_side': 'LEFT'}, {'side': 'LEFT'}, {'start_line': True}, {'start_line': 3}):
+            comment = {**good, **change}
+            encoded = PREFIX + json.dumps({'body': 'summary', 'comments': [comment]})
+            self.assertEqual(unpack_review(encoded), (encoded, []))
+            with patch('github_app_transport._request') as request, self.assertRaises(RuntimeError):
+                publish_transport('token', '/repos/o/r/pulls/1/reviews',
+                                  {'commit_id': 'a' * 40, 'event': 'COMMENT', 'body': 'summary', 'comments': [comment]})
+            request.assert_not_called()
+
     def test_changed_lines_and_fallback(self):
         text = json.dumps({'body': '요약', 'comments': [
             {'path': 'src/a.py', 'line': 2, 'body': '오류'},

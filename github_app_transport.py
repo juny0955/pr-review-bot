@@ -191,13 +191,10 @@ def publish_transport(token, path, body):
             or not isinstance(body['body'], str) or not body['body'].strip()):
         raise RuntimeError('GitHub transport failed')
     try:
-        from inline_review import PATH
+        from inline_review import valid_comment
         comments = body.get('comments', [])
         if (type(comments) is not list or len(comments) > 100 or any(
-                type(c) is not dict or set(c) != {'path', 'line', 'side', 'body'}
-                or not isinstance(c['path'], str) or not PATH.fullmatch(c['path'])
-                or type(c['line']) is not int or c['line'] <= 0 or c['side'] != 'RIGHT'
-                or not isinstance(c['body'], str) or not c['body'].strip()
+                not valid_comment(c)
                 or len(c['body'].encode('utf-8')) > 65536 for c in comments)):
             raise ValueError('invalid comments')
         if len(body['body'].encode('utf-8')) > 65536 + 128:

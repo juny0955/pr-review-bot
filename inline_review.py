@@ -7,11 +7,11 @@ PATH = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*
 HUNK = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?\Z')
 
 
-def changed_lines(diff):
+def changed_hunks(diff):
     # ponytail: reject quoted/unusual paths and malformed sections rather than guessing.
     if not diff.endswith('\n'):
         return set()
-    found = set()
+    found = []
     for section in re.split(r'^diff --git ', diff, flags=re.MULTILINE)[1:]:
         lines = section.splitlines()
         if not lines:
@@ -31,7 +31,7 @@ def changed_lines(diff):
         if i + 1 >= len(lines) or lines[i + 1] != '+++ b/' + path:
             continue
         i += 2
-        added = set()
+        hunks = []
         valid = True
         while i < len(lines):
             m = HUNK.fullmatch(lines[i])
@@ -40,6 +40,7 @@ def changed_lines(diff):
                 break
             old, new = int(m[2] or 1), int(m[4] or 1)
             line = int(m[3])
+            added = set()
             i += 1
             while i < len(lines) and not lines[i].startswith('@@ '):
                 s = lines[i]
@@ -53,7 +54,7 @@ def changed_lines(diff):
                     old -= 1
                 if s[0] in ' +':
                     if s[0] == '+' and line > 0:
-                        added.add((path, line))
+                        added.add(line)
                     line += 1
                     new -= 1
                 if old < 0 or new < 0:
@@ -63,9 +64,33 @@ def changed_lines(diff):
             if not valid or old or new:
                 valid = False
                 break
+            hunks.append((path, added))
         if valid:
-            found.update(added)
+            found.extend(hunks)
     return found
+
+
+def changed_lines(diff):
+    return {(path, line) for path, lines in changed_hunks(diff) for line in lines}
+
+
+def valid_location(comment, hunks):
+    start = comment.get('start_line', comment['line'])
+    end = comment['line']
+    return any(path == comment['path'] and end - start + 1 <= len(lines) and
+               all(line in lines for line in range(start, end + 1))
+               for path, lines in hunks)
+
+
+def valid_comment(item):
+    keys = {'path', 'line', 'side', 'body'}
+    return (type(item) is dict and set(item) in (keys, keys | {'start_line', 'start_side'}) and
+            isinstance(item['path'], str) and PATH.fullmatch(item['path']) and
+            type(item['line']) is int and item['line'] > 0 and item['side'] == 'RIGHT' and
+            isinstance(item['body'], str) and bool(item['body'].strip()) and
+            ('start_line' not in item or
+             type(item['start_line']) is int and 0 < item['start_line'] < item['line'] and
+             item['start_side'] == 'RIGHT'))
 
 
 def _unique_object(pairs):
@@ -95,16 +120,18 @@ def prepare_review(text, diff):
         if (type(data) is not dict or set(data) != {'body', 'comments'} or
                 not isinstance(data['body'], str) or type(data['comments']) is not list):
             raise ValueError()
-        valid = changed_lines(diff)
+        hunks = changed_hunks(diff)
         body = [data['body'].strip()]
         comments = []
         for item in data['comments']:
-            if (type(item) is not dict or set(item) != {'path', 'line', 'body'} or
+            if (type(item) is not dict or set(item) not in ({'path', 'line', 'body'}, {'path', 'start_line', 'line', 'body'}) or
                     not isinstance(item['body'], str) or not item['body'].strip()):
                 raise ValueError()
-            path, line = item['path'], item['line']
-            if isinstance(path, str) and type(line) is int and (path, line) in valid:
-                comments.append({'path': path, 'line': line, 'side': 'RIGHT', 'body': item['body']})
+            comment = {**item, 'side': 'RIGHT'}
+            if 'start_line' in item:
+                comment['start_side'] = 'RIGHT'
+            if valid_comment(comment) and valid_location(comment, hunks):
+                comments.append(comment)
             else:
                 body.append(item['body'].strip())
         result = {'body': '\n\n'.join(s for s in body if s) or '리뷰 의견입니다.', 'comments': comments}
@@ -121,10 +148,7 @@ def unpack_review(review):
         if type(data) is not dict or set(data) != {'body', 'comments'} or not isinstance(data['body'], str) or not data['body'].strip() or type(data['comments']) is not list:
             raise ValueError()
         for item in data['comments']:
-            if (type(item) is not dict or set(item) != {'path', 'line', 'side', 'body'} or
-                    not isinstance(item['path'], str) or not PATH.fullmatch(item['path']) or
-                    type(item['line']) is not int or item['line'] <= 0 or item['side'] != 'RIGHT' or
-                    not isinstance(item['body'], str) or not item['body'].strip()):
+            if not valid_comment(item):
                 raise ValueError()
         return data['body'], data['comments']
     except (ValueError, TypeError, RecursionError):
