@@ -22,7 +22,11 @@ class PublicationPollErrorsTest(unittest.TestCase):
              patch.object(orchestrator, 'publish_worker_result', side_effect=ValueError('secret')) as publish, \
              contextlib.redirect_stdout(output):
             orchestrator.publication_loop('fake', {}, Mock(), Mock(), '', '', '', Stop())
-        self.assertEqual(output.getvalue().splitlines(), ['{"status": "publication_error"}'] * 3)
+        self.assertEqual(output.getvalue().splitlines(), [
+            '{"status": "publication_error", "stage": "poll", "exception": "OperationalError"}',
+            '{"status": "publication_error", "stage": "job", "exception": "ValueError"}',
+            '{"status": "publication_error", "stage": "poll", "exception": "OperationalError"}',
+        ])
         self.assertEqual(publish.call_count, 2)
 
 

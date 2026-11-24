@@ -481,7 +481,7 @@ class ReconcileTests(unittest.TestCase):
         transport = Mock(side_effect=RuntimeError('secret details'))
         with patch.object(orchestrator, 'inventory_transport', transport), redirect_stdout(StringIO()) as output:
             orchestrator.inventory_loop(self.auth, self.gate, self.policy, Stop())
-        self.assertEqual(output.getvalue(), '{"status": "inventory_error"}\n')
+        self.assertEqual(output.getvalue(), '{"status": "inventory_error", "stage": "inventory", "exception": "RuntimeError"}\n')
         self.assertEqual((self.policy.read_bytes(), gate_snapshot(self.gate)), before)
         self.assertEqual(transport.call_count, 1)
 

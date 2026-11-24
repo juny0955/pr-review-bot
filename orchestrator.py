@@ -21,9 +21,17 @@ from github_app_transport import installation_transport, inventory_transport, pu
 from installation_inventory import reconcile_installation, SyncSuperseded
 
 
-def _status(value):
+def _status(value, *, stage=None, error=None):
     # Never serialize adapter exceptions, job contents, or model output.
-    print(json.dumps({'status': value}), flush=True)
+    data = {'status': value}
+    if stage is not None:
+        # ponytail: exact types only; custom exception names can contain secrets.
+        kinds = ((ValueError, 'ValueError'), (RuntimeError, 'RuntimeError'),
+                 (OSError, 'OSError'), (TimeoutError, 'TimeoutError'),
+                 (sqlite3.OperationalError, 'OperationalError'),
+                 (sqlite3.IntegrityError, 'IntegrityError'))
+        data.update(stage=stage, exception=next((name for kind, name in kinds if type(error) is kind), 'other'))
+    print(json.dumps(data), flush=True)
 
 
 def deliver_notification(notifier, channel, content):
@@ -48,12 +56,12 @@ def inventory_loop(auth, gate, repos, stop, poll_interval=60, *, failed=None):
             reconcile_installation(auth, inventory_transport, gate, repos)
         except SyncSuperseded:
             continue
-        except Exception:
+        except Exception as error:
             if failed is not None:
                 failed.set()
             stop.set()
             try:
-                _status('inventory_error')
+                _status('inventory_error', stage='inventory', error=error)
             except OSError:
                 pass
             return
@@ -108,16 +116,16 @@ def publication_loop(db, repos, github, auth, ledger, gate, secret, stop, poll_i
                     else:
                         ambiguous.discard(delivery)
                         retries.pop(delivery, None)
-                except Exception:
+                except Exception as error:
                     if delivery in ambiguous:
                         delay = min(300, retries[delivery][1] * 2)
                         retries[delivery] = (time.monotonic() + delay, delay)
                     if delivery not in errors:
-                        _status('publication_error')
+                        _status('publication_error', stage='job', error=error)
                         errors.add(delivery)
-        except Exception:
+        except Exception as error:
             if not poll_error:
-                _status('publication_error')
+                _status('publication_error', stage='poll', error=error)
                 poll_error = True
         stop.wait(poll_interval)
 
