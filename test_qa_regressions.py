@@ -43,7 +43,7 @@ class RegressionTests(unittest.TestCase):
             output = io.StringIO()
             with patch.object(o, 'publish_worker_result', side_effect=publish) as mock, contextlib.redirect_stdout(output):
                 o.publication_loop(db, {}, Mock(), Mock(), '', '', '', Stop())
-            self.assertEqual(output.getvalue().splitlines(), ['{"status": "publication_error"}', '{"status": "publication_sent"}'])
+            self.assertEqual(output.getvalue().splitlines(), ['{"status": "publication_error", "stage": "job", "exception": "ValueError"}', '{"status": "publication_sent"}'])
             self.assertEqual([c.args[1] for c in mock.call_args_list], ['bad', 'good', 'bad', 'bad'])
 
     def test_publication_thread_start_failure_stops_and_joins_notification(self):

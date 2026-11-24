@@ -44,7 +44,7 @@ class InventoryExitTest(unittest.TestCase):
                  patch.object(orchestrator, 'run_loop', side_effect=run), \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(orchestrator.main(args), 1)
-            self.assertEqual(output.getvalue(), '{"status": "inventory_error"}\n')
+            self.assertEqual(output.getvalue(), '{"status": "inventory_error", "stage": "inventory", "exception": "RuntimeError"}\n')
 
 
 if __name__ == '__main__':
