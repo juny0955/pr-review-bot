@@ -42,15 +42,20 @@ def notification_loop(outbox, notifier, channel, stop, *, poll_interval=5):
             stop.wait(poll_interval)
 
 
-def inventory_loop(auth, gate, repos, stop, poll_interval=60):
+def inventory_loop(auth, gate, repos, stop, poll_interval=60, *, failed=None):
     while not stop.wait(poll_interval):
         try:
             reconcile_installation(auth, inventory_transport, gate, repos)
         except SyncSuperseded:
             continue
         except Exception:
-            _status('inventory_error')
+            if failed is not None:
+                failed.set()
             stop.set()
+            try:
+                _status('inventory_error')
+            except OSError:
+                pass
             return
 
 
@@ -203,6 +208,7 @@ def main(argv=None):
                         notifications_enabled=args.enable_discord_notifications,
                         webhook_secret=os.environ.get('WEBHOOK_SECRET'))
         stop = threading.Event()
+        inventory_failed = threading.Event()
         previous = {}
         def request_stop(signum, frame):
             stop.set()
@@ -213,7 +219,8 @@ def main(argv=None):
             try:
                 if args.sync_installation:
                     inventory_thread = threading.Thread(target=inventory_loop,
-                        args=(github.auth, args.publication_gate, args.repos, stop))
+                        args=(github.auth, args.publication_gate, args.repos, stop),
+                        kwargs={'failed': inventory_failed})
                     inventory_thread.start()
                     started.append(inventory_thread)
                 if notifier is not None:
@@ -237,7 +244,7 @@ def main(argv=None):
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
-        return 0
+        return 1 if inventory_failed.is_set() else 0
     except IsolationUnavailable:
         _status('isolation_unavailable')
         return 1

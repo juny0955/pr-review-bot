@@ -16,7 +16,7 @@ import re
 import time
 
 from repo_config import allowed
-from inline_review import unpack_review, changed_lines
+from inline_review import unpack_review, changed_hunks, valid_location
 
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 # ponytail: known patterns only; use a maintained secret scanner for broader coverage.
@@ -104,11 +104,11 @@ class GitHubPublisher:
         body, comments = unpack_review(review)
         if comments:
             try:
-                valid = changed_lines(self.diff(repo, number, sha, base_sha)) if callable(self.diff) else set()
+                valid = changed_hunks(self.diff(repo, number, sha, base_sha)) if callable(self.diff) else []
             except Exception:
                 valid = set()
-            rejected = [c['body'] for c in comments if (c['path'], c['line']) not in valid]
-            comments = [c for c in comments if (c['path'], c['line']) in valid]
+            rejected = [c['body'] for c in comments if not valid_location(c, valid)]
+            comments = [c for c in comments if valid_location(c, valid)]
             if rejected:
                 body += '\n\n' + '\n\n'.join(rejected)
             actual = self.current(repo, number)
